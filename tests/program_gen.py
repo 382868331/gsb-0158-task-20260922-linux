@@ -42,7 +42,41 @@ def generate(seed: int, max_depth: int = 4) -> Schema:
     """生成一个闭合程序（所有 shift 都有同 tag prompt 包围）。"""
     rng = Lcg(seed)
 
+    def pure(d: int, vars_: List[str]) -> Schema:
+        """钩子专用：只生成 int/add/立即调用 lam/var，绝不含 shift/prompt/
+        wind——保证钩子静态合法（不捕获续延）且不自行越界。"""
+        if d == 0:
+            if vars_ and rng.below(3) == 0:
+                return ("var", vars_[rng.below(len(vars_))])
+            return ("int", rng.below(6))
+        choice = rng.below(3)
+        if choice == 0:
+            return ("add", pure(d - 1, vars_), pure(d - 1, vars_))
+        if choice == 1:
+            x = f"h{len(vars_)}_d{d}"
+            return (
+                "call",
+                ("lam", x, pure(d - 1, vars_ + [x])),
+                pure(d - 1, vars_),
+            )
+        if vars_ and rng.below(2) == 0:
+            return ("var", vars_[rng.below(len(vars_))])
+        return ("int", rng.below(6))
+
     def gen(d: int, vars_: List[str], tags: Tuple[int, ...]) -> Schema:
+        term = gen_raw(d, vars_, tags)
+        # 独立抽取：约 1/5 概率外包一层 dynamic-wind（钩子为无 shift 纯
+        # 表达式）。不挤占原有 shift/类型错误的选择概率，保持错误混合比例。
+        if d > 0 and rng.below(5) == 0:
+            term = (
+                "wind",
+                pure(max(d - 1, 0), vars_),
+                term,
+                pure(max(d - 1, 0), vars_),
+            )
+        return term
+
+    def gen_raw(d: int, vars_: List[str], tags: Tuple[int, ...]) -> Schema:
         if d == 0:
             if vars_ and rng.below(3) == 0:
                 return ("var", vars_[rng.below(len(vars_))])
@@ -114,4 +148,6 @@ def to_ast(s: Schema):
         return delimcc.Prompt(s[1], to_ast(s[2]))
     if t == "shift":
         return delimcc.Shift(s[1], s[2], to_ast(s[3]))
+    if t == "wind":
+        return delimcc.Wind(to_ast(s[1]), to_ast(s[2]), to_ast(s[3]))
     raise ValueError(f"未知模式: {s!r}")  # pragma: no cover

@@ -6,6 +6,7 @@ DelimccError
     ├── UnboundVariableError
     ├── RuntimeTypeError
     ├── UncaughtShiftError   shift 找不到匹配 prompt（无解，非预算问题）
+    ├── HookShiftError       钩子表达式中动态触发 shift 捕获续延
     └── StepLimitError       求值步数预算耗尽（资源限制，与语义无解区分）
 """
 
@@ -58,6 +59,25 @@ class UncaughtShiftError(EvaluationError):
     def __init__(self, tag: int):
         self.tag = tag
         super().__init__(f"shift 找不到 tag={tag} 的包围 prompt")
+
+
+class HookShiftError(EvaluationError):
+    """在 Wind 钩子表达式求值期间动态触发了 shift 捕获。
+
+    钩子 AST 中静态出现的 Shift 在构造期即被
+    ``InvalidProgramError`` 拒绝；本错误对应静态检查无法覆盖的情形：
+    钩子表达式调用了词法环境中其体内含 shift 的闭包。契约规定钩子
+    只记录事件、不捕获续延，故这是确定性的求值期语义错误，触发后按
+    异常退出处理（外层仍激活作用域的 error 钩子照常执行）。
+    """
+
+    def __init__(self, tag: int, phase: str):
+        self.tag = tag
+        self.phase = phase
+        super().__init__(
+            f"wind 钩子（{phase}）中不允许触发 shift 捕获（tag={tag}）："
+            "钩子只记录事件，不捕获续延"
+        )
 
 
 class StepLimitError(EvaluationError):

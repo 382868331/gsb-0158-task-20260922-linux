@@ -67,7 +67,10 @@ class ContVal(Value):
     """被 shift 捕获的续延值。
 
     tag: 重新包裹时使用的 prompt tag；frames: 捕获到的不可变帧元组
-    （栈底->栈顶顺序）。帧结构属于解释器内部，不对外保证稳定。
+    （栈底->栈顶顺序，跨作用域处为 windBoundary 边界帧，被一起捕获的
+    异 tag 源码 prompt 帧原样保留）。恢复时按 frames 外->内扫描，依次
+    重新执行 wind 的 before 与重新建立其中的 prompt 帧。帧结构属于
+    解释器内部，不对外保证稳定。
     """
 
     __slots__ = ("tag", "frames")

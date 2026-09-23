@@ -3,10 +3,11 @@
 公开接口见包顶层导出；语言定义与求值契约见 README.md。
 """
 
-from .ast import Add, Call, Expr, Int, Lam, Prompt, Shift, Var
+from .ast import Add, Call, Expr, Int, Lam, Prompt, Shift, Var, Wind
 from .errors import (
     DelimccError,
     EvaluationError,
+    HookShiftError,
     InvalidProgramError,
     RuntimeTypeError,
     StepLimitError,
@@ -25,6 +26,7 @@ __all__ = [
     "Call",
     "Prompt",
     "Shift",
+    "Wind",
     "IntVal",
     "CloVal",
     "ContVal",
@@ -35,6 +37,7 @@ __all__ = [
     "InvalidProgramError",
     "EvaluationError",
     "UncaughtShiftError",
+    "HookShiftError",
     "UnboundVariableError",
     "RuntimeTypeError",
     "StepLimitError",

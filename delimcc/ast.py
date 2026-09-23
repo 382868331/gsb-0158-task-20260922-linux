@@ -9,6 +9,12 @@ Lam(param, body)                单参数 lambda
 Call(fn, arg)                   函数调用
 Prompt(tag, body)               定界提示，tag 为显式 int
 Shift(tag, param, body)         捕获到最近同 tag prompt 的求值上下文
+Wind(before, body, after)       作用域钩子：进入执行 before，离开执行 after
+
+Wind 的 before/after 称为**钩子**：钩子按普通表达式求值，其结果值被
+丢弃，只用于通过求值事件观察进入/离开顺序。钩子中**静态禁止 Shift**
+（含嵌套在 lambda 等之内的 Shift）——钩子不捕获续延；违规在构造期抛
+``InvalidProgramError``。
 
 节点可选带位置信息 loc: 形如 ``("<文件>", 行, 列)`` 的三元组，仅用于
 错误定位；库自身构造的节点 loc 为 None。
@@ -26,7 +32,7 @@ from .errors import InvalidProgramError
 
 Loc = Optional[Tuple[str, int, int]]
 
-_VALID = {"Int", "Var", "Add", "Lam", "Call", "Prompt", "Shift"}
+_VALID = {"Int", "Var", "Add", "Lam", "Call", "Prompt", "Shift", "Wind"}
 
 
 def _is_int(x: object) -> bool:
@@ -113,6 +119,8 @@ def _fields(e: Expr) -> Tuple[object, ...]:
         return (e.tag, e.body)  # type: ignore[attr-defined]
     if k == "Shift":
         return (e.tag, e.param, e.body)  # type: ignore[attr-defined]
+    if k == "Wind":
+        return (e.before, e.body, e.after)  # type: ignore[attr-defined]
     raise InvalidProgramError(f"未知节点种类: {k!r}")
 
 
@@ -252,6 +260,56 @@ class Shift(Expr):
 
     def with_loc(self, loc: Loc) -> "Shift":
         return Shift(self.tag, self.param, self.body, loc)
+
+
+class Wind(Expr):
+    """wind(before, body, after)：动态作用域钩子。
+
+    进入作用域时先求值 ``before``（其值丢弃），body 正常完成后求值
+    ``after``（其值丢弃），整个 Wind 的值即 body 的值。shift 捕获跨过
+    本作用域、续延恢复重入本作用域，以及错误向外传播穿过本作用域时，
+    钩子的执行规则见 interpreter 模块文档。
+
+    ``before``/``after`` 中**任何位置**（含嵌套 lambda 体内）都不允许
+    出现 Shift 节点：钩子只记录事件，不在钩子里捕获续延。该限制在构造
+    期静态检查，违规立即抛 ``InvalidProgramError``，不产生半构造节点。
+    """
+
+    __slots__ = ("before", "body", "after")
+    kind = "Wind"
+
+    def __init__(self, before: Expr, body: Expr, after: Expr, loc: Loc = None):
+        super().__init__(loc)
+        self.before = _check_child(before, "Wind.before", loc)
+        self.body = _check_child(body, "Wind.body", loc)
+        self.after = _check_child(after, "Wind.after", loc)
+        _check_no_shift(self.before, "Wind.before", loc)
+        _check_no_shift(self.after, "Wind.after", loc)
+
+    def children(self) -> Tuple["Expr", ...]:
+        return (self.before, self.body, self.after)
+
+    def with_loc(self, loc: Loc) -> "Wind":
+        return Wind(self.before, self.body, self.after, loc)
+
+
+def _contains_shift(e: Expr) -> bool:
+    """迭代检查 e 的任意子树中是否存在 Shift 节点（含 lambda 体内）。"""
+    todo = [e]
+    while todo:
+        x = todo.pop()
+        if x.kind == "Shift":
+            return True
+        todo.extend(x.children())
+    return False
+
+
+def _check_no_shift(e: Expr, where: str, loc: Loc) -> None:
+    if _contains_shift(e):
+        raise InvalidProgramError(
+            f"{where} 钩子中不允许出现 shift（钩子只记录事件，不捕获续延）",
+            loc,
+        )
 
 
 def _check_child(e: object, where: str, loc: Loc) -> Expr:
