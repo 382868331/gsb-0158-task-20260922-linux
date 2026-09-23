@@ -42,12 +42,33 @@ def generate(seed: int, max_depth: int = 4) -> Schema:
     """生成一个闭合程序（所有 shift 都有同 tag prompt 包围）。"""
     rng = Lcg(seed)
 
+    def hook_expr(d: int, vars_: List[str]) -> Schema:
+        """钩子表达式：只做事件记录，不含 shift/k 调用（契约）。
+
+        用小整数、变量（词法环境里的普通变量）、lambda 与加法构造；
+        变量若是续延 k，被调用/参与加法会与核心一样报 hook 之外的错误，
+        故这里只允许取不以 k 开头的普通变量。
+        """
+        plain = [x for x in vars_ if not x.startswith("k")]
+        roll = rng.below(3)
+        if roll == 0 and plain:
+            return ("var", plain[rng.below(len(plain))])
+        if roll == 1 and d >= 1 and plain:
+            x = f"h{len(vars_)}_d{d}"
+            return (
+                "add",
+                ("int", rng.below(5)),
+                ("call", ("lam", x, ("add", ("var", x), ("int", rng.below(3)))),
+                      ("int", rng.below(5))),
+            )
+        return ("int", rng.below(100))
+
     def gen(d: int, vars_: List[str], tags: Tuple[int, ...]) -> Schema:
         if d == 0:
             if vars_ and rng.below(3) == 0:
                 return ("var", vars_[rng.below(len(vars_))])
             return ("int", rng.below(6))
-        choice = rng.below(7)
+        choice = rng.below(8)
         if choice == 0:  # 加法
             return ("add", gen(d - 1, vars_, tags), gen(d - 1, vars_, tags))
         if choice == 1:  # 立即调用 lambda（fn 位置必为 lam）
@@ -83,7 +104,14 @@ def generate(seed: int, max_depth: int = 4) -> Schema:
             if kvars:
                 return ("add", ("int", rng.below(4)), ("var", kvars[-1]))
             return ("int", rng.below(6))
-        if choice in (5, 6) or not tags:  # 建立 prompt
+        if choice == 5:  # wind 动态作用域（钩子为合规事件表达式）
+            return (
+                "wind",
+                hook_expr(max(d - 2, 0), vars_),
+                gen(d - 1, vars_, tags),
+                hook_expr(max(d - 2, 0), vars_),
+            )
+        if choice in (6, 7) or not tags:  # 建立 prompt
             tag = TAGS[rng.below(len(TAGS))]
             return ("prompt", tag, gen(d - 1, vars_, tuple(dict.fromkeys(tags + (tag,)))))
         # 不可达
@@ -114,4 +142,6 @@ def to_ast(s: Schema):
         return delimcc.Prompt(s[1], to_ast(s[2]))
     if t == "shift":
         return delimcc.Shift(s[1], s[2], to_ast(s[3]))
+    if t == "wind":
+        return delimcc.Wind(to_ast(s[1]), to_ast(s[2]), to_ast(s[3]))
     raise ValueError(f"未知模式: {s!r}")  # pragma: no cover

@@ -6,7 +6,8 @@ DelimccError
     ├── UnboundVariableError
     ├── RuntimeTypeError
     ├── UncaughtShiftError   shift 找不到匹配 prompt（无解，非预算问题）
-    └── StepLimitError       求值步数预算耗尽（资源限制，与语义无解区分）
+    ├── HookViolationError   wind 钩子内捕获/调用续延（违反钩子契约）
+    └── StepLimitError       求值步数预算耗尽（资源限制，立即中止不跑钩子）
 """
 
 from __future__ import annotations
@@ -58,6 +59,19 @@ class UncaughtShiftError(EvaluationError):
     def __init__(self, tag: int):
         self.tag = tag
         super().__init__(f"shift 找不到 tag={tag} 的包围 prompt")
+
+
+class HookViolationError(EvaluationError):
+    """wind 的钩子（before/after）内捕获或调用了续延。
+
+    契约要求钩子只记录事件：钩子里的游离 ``shift``（无论是否存在匹配
+    prompt）与对续延值的调用都在此报错；钩子里的其他求值错误
+    （未绑定变量、类型错误等）仍按原类型抛出。
+    """
+
+    def __init__(self, where: str, detail: str):
+        self.where = where
+        super().__init__(f"wind 的 {where} 钩子里不允许 {detail}")
 
 
 class StepLimitError(EvaluationError):

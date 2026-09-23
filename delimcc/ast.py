@@ -9,6 +9,7 @@ Lam(param, body)                单参数 lambda
 Call(fn, arg)                   函数调用
 Prompt(tag, body)               定界提示，tag 为显式 int
 Shift(tag, param, body)         捕获到最近同 tag prompt 的求值上下文
+Wind(before, body, after)       作用域钩子：进入跑 before，离开跑 after
 
 节点可选带位置信息 loc: 形如 ``("<文件>", 行, 列)`` 的三元组，仅用于
 错误定位；库自身构造的节点 loc 为 None。
@@ -26,7 +27,7 @@ from .errors import InvalidProgramError
 
 Loc = Optional[Tuple[str, int, int]]
 
-_VALID = {"Int", "Var", "Add", "Lam", "Call", "Prompt", "Shift"}
+_VALID = {"Int", "Var", "Add", "Lam", "Call", "Prompt", "Shift", "Wind"}
 
 
 def _is_int(x: object) -> bool:
@@ -113,6 +114,8 @@ def _fields(e: Expr) -> Tuple[object, ...]:
         return (e.tag, e.body)  # type: ignore[attr-defined]
     if k == "Shift":
         return (e.tag, e.param, e.body)  # type: ignore[attr-defined]
+    if k == "Wind":
+        return (e.before, e.body, e.after)  # type: ignore[attr-defined]
     raise InvalidProgramError(f"未知节点种类: {k!r}")
 
 
@@ -254,6 +257,37 @@ class Shift(Expr):
         return Shift(self.tag, self.param, self.body, loc)
 
 
+class Wind(Expr):
+    """``wind(before, body, after)``：进入作用域求 before，离开求 after。
+
+    before/after 是只产生事件的钩子表达式，其值被丢弃；整个 Wind 的
+    值是 body 的值。作用域在以下时机离开/重入：
+
+    * body 正常完成：before → body → after；
+    * body 异常退出：由内向外执行沿途各作用域的 after，再抛原错误；
+    * ``shift`` 捕获跨越本作用域：离开时跑 after，续延 ``k(v)`` 恢复
+      重新进入时跑 before（顺序见 README）。
+
+    钩子表达式内不允许出现游离的 ``shift`` 或对续延值的调用
+    （求值期抛 ``HookViolationError``）；钩子里只应记录事件。
+    """
+
+    __slots__ = ("before", "body", "after")
+    kind = "Wind"
+
+    def __init__(self, before: Expr, body: Expr, after: Expr, loc: Loc = None):
+        super().__init__(loc)
+        self.before = _check_child(before, "Wind.before", loc)
+        self.body = _check_child(body, "Wind.body", loc)
+        self.after = _check_child(after, "Wind.after", loc)
+
+    def children(self) -> Tuple["Expr", ...]:
+        return (self.before, self.body, self.after)
+
+    def with_loc(self, loc: Loc) -> "Wind":
+        return Wind(self.before, self.body, self.after, loc)
+
+
 def _check_child(e: object, where: str, loc: Loc) -> Expr:
     if not isinstance(e, Expr):
         raise InvalidProgramError(
@@ -268,4 +302,4 @@ def _check_child(e: object, where: str, loc: Loc) -> Expr:
 Tag = int
 
 # 重新导出 Union 以便上层类型注解。
-Node = Union[Int, Var, Add, Lam, Call, Prompt, Shift]
+Node = Union[Int, Var, Add, Lam, Call, Prompt, Shift, Wind]

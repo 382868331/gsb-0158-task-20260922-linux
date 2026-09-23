@@ -8,7 +8,9 @@ import unittest
 from delimcc import (
     Add,
     Call,
+    EvaluationError,
     Event,
+    HookViolationError,
     Int,
     InvalidProgramError,
     Lam,
@@ -19,6 +21,7 @@ from delimcc import (
     UnboundVariableError,
     UncaughtShiftError,
     Var,
+    Wind,
     interpret,
 )
 
@@ -340,6 +343,241 @@ class TestLimits(unittest.TestCase):
         r = interpret(Add(Int(1), Int(2)))
         self.assertGreaterEqual(r.steps, 1)
         self.assertEqual(r.nodes, 3)
+
+
+def wind_events(prog, **kw):
+    """成功时返回 (值, wind 事件名序列)；失败时返回 (异常, 事件序列)。"""
+    try:
+        r = interpret(prog, trace=True, **kw)
+        evs = [e.name for e in r.events if e.name.startswith("wind_")]
+        return r.value.value, evs
+    except EvaluationError as ex:
+        evs = [
+            e.name
+            for e in getattr(ex, "events", ())
+            if e.name.startswith("wind_")
+        ]
+        return ex, evs
+
+
+class TestWindNormal(unittest.TestCase):
+    def test_hook_value_discarded_body_value_kept(self):
+        # before/after 的值被丢弃，wind 取 body 值。
+        e = Wind(Int(10), Int(30), Int(11))
+        val, evs = wind_events(e)
+        self.assertEqual(val, 30)
+        self.assertEqual(evs, ["wind_before", "wind_after"])
+        # 事件带钩子值（随后丢弃），可用于区分作用域。
+        full = [
+            (ev.name, ev.args)
+            for ev in interpret(e, trace=True).events
+            if ev.name.startswith("wind_")
+        ]
+        self.assertEqual(full, [("wind_before", ("10",)), ("wind_after", ("11",))])
+
+    def test_nested_scopes_lifo(self):
+        # wind(b10, wind(b20, 30, a21), a11)：进入外->内，离开内->外。
+        e = Wind(Int(10), Wind(Int(20), Int(30), Int(21)), Int(11))
+        val, evs = wind_events(e)
+        self.assertEqual(val, 30)
+        self.assertEqual(evs, ["wind_before", "wind_before",
+                               "wind_after", "wind_after"])
+        vals = [ev.args[0] for ev in interpret(e, trace=True).events
+                if ev.name.startswith("wind_")]
+        self.assertEqual(vals, ["10", "20", "21", "11"])
+
+    def test_hooks_can_use_lexical_variables(self):
+        # before/after 是普通表达式，可读词法环境里的变量。
+        e = Call(
+            Lam("x", Wind(Var("x"), Add(Var("x"), Int(5)), Add(Var("x"), Int(1)))),
+            Int(40),
+        )
+        val, evs = wind_events(e)
+        self.assertEqual(val, 45)
+        self.assertEqual(
+            [ev.args[0] for ev in interpret(e, trace=True).events
+             if ev.name.startswith("wind_")],
+            ["40", "41"],
+        )
+
+    def test_wind_identity_without_shift(self):
+        # 无 shift 时 wind 不影响算术结果，只多进出事件。
+        e = Wind(Int(1), Add(Int(2), Add(Int(3), Int(4))), Int(9))
+        self.assertEqual(iv(e), 9)
+
+
+class TestWindCaptureResume(unittest.TestCase):
+    def test_capture_leaves_scope_then_resume_reenters(self):
+        # prompt1( wind(b2, 100 + shift(k, k(5)), a3) )
+        e = Prompt(
+            1,
+            Wind(Int(2), Add(Int(100), Shift(1, "k", Call(Var("k"), Int(5)))), Int(3)),
+        )
+        val, evs = wind_events(e)
+        self.assertEqual(val, 105)
+        # 进入 -> 捕获离开(after) -> 恢复重入(before) -> 值离开重放作用域(after)
+        self.assertEqual(evs, ["wind_before", "wind_after",
+                               "wind_before", "wind_after"])
+
+    def test_two_nested_scopes_cross_scope_resume_order(self):
+        # 两个 wind 都在捕获段内：离开内->外，重入外->内，再离开内->外。
+        e = Prompt(
+            1,
+            Wind(
+                Int(11),
+                Wind(Int(22), Add(Int(100), Shift(1, "k", Call(Var("k"), Int(5)))),
+                     Int(33)),
+                Int(44),
+            ),
+        )
+        val, evs = wind_events(e)
+        self.assertEqual(val, 105)
+        self.assertEqual(
+            evs,
+            ["wind_before", "wind_before",  # 进入外11、内22
+             "wind_after", "wind_after",    # 捕获离开内33、外44
+             "wind_before", "wind_before",  # 恢复重入外11、内22
+             "wind_after", "wind_after"],   # 值离开重放：内33、外44
+        )
+
+    def test_repeated_resume_reenters_each_time(self):
+        # k(k(5))：捕获离开一次，每次恢复都完整进出，before/after 各 3。
+        e = Prompt(
+            1,
+            Wind(Int(1),
+                 Add(Int(100), Shift(1, "k", Call(Var("k"), Call(Var("k"), Int(5))))),
+                 Int(2)),
+        )
+        val, evs = wind_events(e)
+        self.assertEqual(val, 205)
+        self.assertEqual(evs.count("wind_before"), 3)
+        self.assertEqual(evs.count("wind_after"), 3)
+
+    def test_nonlocal_return_leaves_but_never_reenters(self):
+        # shift body 不调用 k：作用域离开后不再重入。
+        e = Prompt(
+            1,
+            Wind(Int(2), Add(Int(100), Shift(1, "k", Int(42))), Int(3)),
+        )
+        val, evs = wind_events(e)
+        self.assertEqual(val, 42)
+        self.assertEqual(evs, ["wind_before", "wind_after"])
+
+    def test_scope_outside_capture_not_reentered(self):
+        # wind 在 prompt 之外：捕获/恢复都不穿越它，只正常进出一次。
+        e = Wind(
+            Int(1),
+            Prompt(1, Add(Int(100), Shift(1, "k", Call(Var("k"), Int(5))))),
+            Int(2),
+        )
+        val, evs = wind_events(e)
+        self.assertEqual(val, 105)
+        self.assertEqual(evs, ["wind_before", "wind_after"])
+
+    def test_call_site_scope_not_captured(self):
+        # k 的调用点在外层新 wind 内：该 wind 不被捕获，恢复不重入它；
+        # 洞值穿过重包 prompt 回到调用点后才离开该 wind。
+        e = Prompt(
+            1,
+            Add(Int(1), Shift(1, "k", Wind(Int(8), Call(Var("k"), Int(7)), Int(9)))),
+        )
+        val, evs = wind_events(e)
+        self.assertEqual(val, 8)
+        # 外层 wind(8,·,9) 正常进入，重放完成、洞值回到其 body 后才离开。
+        self.assertEqual(evs, ["wind_before", "wind_after"])
+        # 捕获段里没有 wind 作用域（shift_capture 只截到 addR 一帧）。
+        cap = [ev for ev in interpret(e, trace=True).events
+               if ev.name == "shift_capture"][0]
+        self.assertEqual(cap.args, (1, 1))
+
+
+class TestWindErrors(unittest.TestCase):
+    def test_body_type_error_runs_after_then_reraises(self):
+        # body 出错：after 仍执行（这里让 after 引用未绑定变量以证明执行），
+        # 最终抛出的是 after 自身的错误。
+        e = Wind(Int(1), Add(Int(1), Lam("x", Var("x"))), Var("after_ran"))
+        with self.assertRaises(UnboundVariableError) as cm:
+            interpret(e, trace=True)
+        self.assertEqual(cm.exception.name, "after_ran")
+        # after 正常时记录离开事件后重抛 body 原错。
+        e2 = Wind(Int(1), Add(Int(1), Lam("x", Var("x"))), Int(99))
+        try:
+            interpret(e2, trace=True)
+            self.fail("应抛 RuntimeTypeError")
+        except RuntimeTypeError as ex:
+            self.assertEqual(
+                [x.name for x in ex.events if x.name.startswith("wind_")],
+                ["wind_before", "wind_after"],
+            )
+
+    def test_nested_error_unwinds_inner_to_outer(self):
+        e = Wind(
+            Int(1),
+            Wind(Int(2), Add(Int(1), Lam("x", Var("x"))), Var("inner_after")),
+            Var("outer_after"),
+        )
+        with self.assertRaises(UnboundVariableError) as cm:
+            interpret(e, trace=True)
+        # 内层 after 先执行并失败；展开不二次进入外层 after。
+        self.assertEqual(cm.exception.name, "inner_after")
+
+    def test_before_failure_never_enters_scope(self):
+        # before 类型错误：作用域从未进入，after 不执行（即使 after 本身
+        # 也非法，也必须报 before 的 RuntimeTypeError 而非未绑定变量）。
+        e = Wind(Add(Int(1), Lam("x", Var("x"))), Int(2), Var("never"))
+        with self.assertRaises(RuntimeTypeError):
+            interpret(e)
+
+    def test_shift_in_before_hook_rejected(self):
+        e = Prompt(1, Wind(Shift(1, "k", Int(0)), Int(2), Int(3)))
+        with self.assertRaises(HookViolationError):
+            interpret(e)
+
+    def test_shift_in_after_hook_rejected(self):
+        e = Prompt(1, Wind(Int(1), Int(2), Shift(1, "k", Int(0))))
+        with self.assertRaises(HookViolationError):
+            interpret(e)
+
+    def test_call_continuation_inside_hook_rejected(self):
+        # shift body 进入一个 wind，其 before 调用 k：钩子里调续延被拒。
+        e = Prompt(
+            1,
+            Shift(1, "k", Wind(Call(Var("k"), Int(3)), Int(1), Int(2))),
+        )
+        with self.assertRaises(HookViolationError):
+            interpret(e)
+
+    def test_uncaught_shift_in_hook_is_hook_violation(self):
+        # 钩子里游离的、无匹配 prompt 的 shift 同样违反钩子契约。
+        e = Wind(Shift(7, "k", Int(0)), Int(1), Int(2))
+        with self.assertRaises(HookViolationError):
+            interpret(e)
+
+    def test_step_limit_does_not_run_hooks(self):
+        # 预算耗尽是资源中止：不展开 after（after 非法也不应被触及）。
+        e = Wind(Int(1), Int(2), Var("never_after"))
+        with self.assertRaises(StepLimitError):
+            interpret(e, trace=True, max_steps=2)
+
+
+class TestWindConstruction(unittest.TestCase):
+    def test_children_must_be_expr(self):
+        for bad in (1, "x", None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(InvalidProgramError):
+                    Wind(bad, Int(1), Int(1))  # type: ignore[arg-type]
+                with self.assertRaises(InvalidProgramError):
+                    Wind(Int(1), bad, Int(1))  # type: ignore[arg-type]
+                with self.assertRaises(InvalidProgramError):
+                    Wind(Int(1), Int(1), bad)  # type: ignore[arg-type]
+
+    def test_node_count_and_equality(self):
+        e = Wind(Int(1), Int(2), Int(3))
+        self.assertEqual(e.node_count(), 4)
+        self.assertEqual(e, Wind(Int(1), Int(2), Int(3)))
+        self.assertNotEqual(e, Wind(Int(1), Int(2), Int(4)))
+        self.assertEqual(e.children(), (Int(1), Int(2), Int(3)))
+        self.assertEqual(e.kind, "Wind")
 
 
 if __name__ == "__main__":
