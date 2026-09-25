@@ -1,13 +1,15 @@
-"""固定输入演示：定界续延的非局部返回，以及两个真实触发的拒绝边界。
+"""固定输入演示：定界续延的非局部返回、一次性续延，以及真实触发的拒绝边界。
 
-运行：python demo.py（仓库根目录，约 1 秒内完成，无网络/无第三方依赖）。
+运行：./.venv/bin/python demo.py（仓库根目录，约 1 秒内完成，无网络/无第三方依赖）。
 
 内容：
   1. 正常结果——非局部返回：多层函数/加法上下文包围 shift，shift 的
      body 不调用续延 k，直接给出 999，中间上下文被整体放弃。
-  2. 语义边界——shift 找不到同 tag 的 prompt，实际抛出
+  2. 一次性续延——shift_once 的句柄经变量别名转手也只能进入一次：
+     第一次调用成功，第二次在原子消费点被拒绝，错误给出消费来源位置。
+  3. 语义边界——shift 找不到同 tag 的 prompt，实际抛出
      UncaughtShiftError（无解，与预算耗尽区分）。
-  3. 输入边界——NaN 不是合法整数字面量，构造时即被
+  4. 输入边界——NaN 不是合法整数字面量，构造时即被
      InvalidProgramError 拒绝（不静默纠正）。
 """
 
@@ -18,11 +20,13 @@ import time
 from delimcc import (
     Add,
     Call,
+    ContinuationConsumedError,
     Int,
     InvalidProgramError,
     Lam,
     Prompt,
     Shift,
+    ShiftOnce,
     UncaughtShiftError,
     Var,
     interpret,
@@ -67,7 +71,46 @@ def main() -> None:
     )
     print(f"   对照（无 shift 的普通求值）= {interpret(ordinary).value.display()}")
 
-    # --- 2. 语义边界：无匹配 prompt -------------------------------------
+    # --- 2. 一次性续延：别名转手也只能进入一次 --------------------------
+    section("[一次性] shift_once：k 经 f、g 两次别名转手，g(1) 成功，g(2) 被拒")
+    loc_first = ("demo", 2, 11)   # g(1) 的调用位置（消费来源）
+    loc_second = ("demo", 2, 20)  # g(2) 的调用位置（本次被拒）
+    once_prog = Prompt(
+        1,
+        ShiftOnce(
+            1,
+            "k",
+            Call(
+                Lam("f", Call(
+                    Lam("g", Add(
+                        Call(Var("g"), Int(1), loc_first),
+                        Call(Var("g"), Int(2), loc_second),
+                    )),
+                    Var("f"),
+                )),
+                Var("k"),
+            ),
+        ),
+    )
+    try:
+        interpret(once_prog, trace=True)
+    except ContinuationConsumedError as ex:
+        print(f"实际捕获异常: {type(ex).__name__}: {ex}")
+        print(f"=> 消费来源位置 consumed_loc={ex.consumed_loc}，"
+              f"本次调用位置 attempt_loc={ex.attempt_loc}")
+
+    # 对照：只调用一次的一次性续延是正常结果（实参 2+3 先求值再消费）。
+    once_ok = Prompt(
+        1,
+        ShiftOnce(1, "k", Call(Var("k"), Add(Int(2), Int(3)), ("demo", 3, 1))),
+    )
+    r_ok = interpret(once_ok, trace=True)
+    print(f"对照（只进入一次）= {r_ok.value.display()}")
+    print("   小步事件序列（注意 add 在 once_consume 之前：先求实参再消费）:")
+    for ev in r_ok.events:
+        print(f"     {ev}")
+
+    # --- 3. 语义边界：无匹配 prompt -------------------------------------
     section("[边界] shift(404, k, 0) 外没有 tag=404 的 prompt")
     bad_program = Add(Int(1), Shift(404, "k", Int(0)))
     try:
@@ -76,7 +119,7 @@ def main() -> None:
         print(f"实际捕获异常: {type(ex).__name__}: {ex}")
         print("=> 这是确定性语义错误（无解），区别于步数预算耗尽。")
 
-    # --- 3. 输入边界：NaN / bool 不得作为整数 ---------------------------
+    # --- 4. 输入边界：NaN / bool 不得作为整数 ---------------------------
     section("[边界] Int(NaN) 与 Int(True) 在构造期被拒绝")
     for label, bad in (("float('nan')", float("nan")), ("True", True)):
         try:

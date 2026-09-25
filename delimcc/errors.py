@@ -6,6 +6,7 @@ DelimccError
     ├── UnboundVariableError
     ├── RuntimeTypeError
     ├── UncaughtShiftError   shift 找不到匹配 prompt（无解，非预算问题）
+    ├── ContinuationConsumedError  一次性续延被第二次进入（带消费来源位置）
     └── StepLimitError       求值步数预算耗尽（资源限制，与语义无解区分）
 """
 
@@ -66,3 +67,32 @@ class StepLimitError(EvaluationError):
     def __init__(self, limit: int):
         self.limit = limit
         super().__init__(f"求值步数超过上限 {limit}（预算耗尽，非语义无解）")
+
+
+def _fmt_loc(loc: Optional[tuple]) -> str:
+    """把 loc 三元组格式化为 文件:行:列；无位置信息时给出明确说明。"""
+    if loc is None:
+        return "未知位置"
+    return f"{loc[0]}:{loc[1]}:{loc[2]}"
+
+
+class ContinuationConsumedError(EvaluationError):
+    """一次性（one-shot）续延句柄被第二次进入。
+
+    句柄在第一次进入前的原子“检查并消费”点已被标记；此后无论经多少
+    变量别名转手，再次调用都在参数求值完成之后、进入截获上下文之前
+    被拒绝，不重新执行截获的上下文。
+
+    ``consumed_loc`` 是首次消费该句柄的调用位置（消费来源），
+    ``attempt_loc`` 是本次被拒绝的调用位置；均可为 None（无位置信息）。
+    """
+
+    def __init__(self, tag: int, consumed_loc: Optional[tuple], attempt_loc: Optional[tuple]):
+        self.tag = tag
+        self.consumed_loc = consumed_loc
+        self.attempt_loc = attempt_loc
+        super().__init__(
+            f"一次性续延（tag={tag}）只能进入一次："
+            f"已在 {_fmt_loc(consumed_loc)} 消费，"
+            f"本次进入（{_fmt_loc(attempt_loc)}）被拒绝"
+        )

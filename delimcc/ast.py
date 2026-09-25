@@ -8,7 +8,8 @@ Add(left, right)                整数加法
 Lam(param, body)                单参数 lambda
 Call(fn, arg)                   函数调用
 Prompt(tag, body)               定界提示，tag 为显式 int
-Shift(tag, param, body)         捕获到最近同 tag prompt 的求值上下文
+Shift(tag, param, body)         捕获到最近同 tag prompt 的求值上下文（多次进入）
+ShiftOnce(tag, param, body)     同上，但续延句柄只能被消费（进入）一次
 
 节点可选带位置信息 loc: 形如 ``("<文件>", 行, 列)`` 的三元组，仅用于
 错误定位；库自身构造的节点 loc 为 None。
@@ -26,7 +27,7 @@ from .errors import InvalidProgramError
 
 Loc = Optional[Tuple[str, int, int]]
 
-_VALID = {"Int", "Var", "Add", "Lam", "Call", "Prompt", "Shift"}
+_VALID = {"Int", "Var", "Add", "Lam", "Call", "Prompt", "Shift", "ShiftOnce"}
 
 
 def _is_int(x: object) -> bool:
@@ -112,6 +113,8 @@ def _fields(e: Expr) -> Tuple[object, ...]:
     if k == "Prompt":
         return (e.tag, e.body)  # type: ignore[attr-defined]
     if k == "Shift":
+        return (e.tag, e.param, e.body)  # type: ignore[attr-defined]
+    if k == "ShiftOnce":
         return (e.tag, e.param, e.body)  # type: ignore[attr-defined]
     raise InvalidProgramError(f"未知节点种类: {k!r}")
 
@@ -254,6 +257,30 @@ class Shift(Expr):
         return Shift(self.tag, self.param, self.body, loc)
 
 
+class ShiftOnce(Expr):
+    """shift_once(tag, k, body)：与 Shift 相同的捕获规则，但 k 是一次性句柄。
+
+    句柄只能进入一次：调用参数先求值，随后原子地“检查并消费”句柄；
+    第二次进入（无论经多少变量别名转手）抛 ContinuationConsumedError，
+    不重新执行截获的上下文。
+    """
+
+    __slots__ = ("tag", "param", "body")
+    kind = "ShiftOnce"
+
+    def __init__(self, tag: int, param: str, body: Expr, loc: Loc = None):
+        super().__init__(loc)
+        self.tag = _check_tag(tag, loc)
+        self.param = _check_name(param, "shift_once 续延参数名", loc)
+        self.body = _check_child(body, "ShiftOnce.body", loc)
+
+    def children(self) -> Tuple["Expr", ...]:
+        return (self.body,)
+
+    def with_loc(self, loc: Loc) -> "ShiftOnce":
+        return ShiftOnce(self.tag, self.param, self.body, loc)
+
+
 def _check_child(e: object, where: str, loc: Loc) -> Expr:
     if not isinstance(e, Expr):
         raise InvalidProgramError(
@@ -268,4 +295,4 @@ def _check_child(e: object, where: str, loc: Loc) -> Expr:
 Tag = int
 
 # 重新导出 Union 以便上层类型注解。
-Node = Union[Int, Var, Add, Lam, Call, Prompt, Shift]
+Node = Union[Int, Var, Add, Lam, Call, Prompt, Shift, ShiftOnce]
