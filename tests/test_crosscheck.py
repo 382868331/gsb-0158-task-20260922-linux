@@ -16,6 +16,7 @@ from reference import RefError, run
 # 参考机错误类别 -> 核心应抛出的错误类型
 ERR_MAP = {
     "uncaught": delimcc.UncaughtShiftError,
+    "consumed": delimcc.ConsumedContinuationError,
     "type": delimcc.RuntimeTypeError,
     "unbound": delimcc.UnboundVariableError,
 }
@@ -37,6 +38,8 @@ def run_both(schema):
         got_kind = (
             "uncaught"
             if isinstance(ex, delimcc.UncaughtShiftError)
+            else "consumed"
+            if isinstance(ex, delimcc.ConsumedContinuationError)
             else "type"
             if isinstance(ex, delimcc.RuntimeTypeError)
             else "unbound"
@@ -142,6 +145,61 @@ class TestHandWrittenAgainstReference(unittest.TestCase):
                 ),
             ),
         ),
+        "once_single_ok": (
+            "prompt",
+            1,
+            (
+                "add",
+                ("int", 10),
+                ("shift1", 1, "k", ("call", ("var", "k"), ("int", 5))),
+            ),
+        ),
+        "once_nested_tags": (
+            "prompt",
+            1,
+            (
+                "prompt",
+                2,
+                (
+                    "add",
+                    ("int", 1),
+                    (
+                        "shift1",
+                        2,
+                        "k",
+                        (
+                            "shift1",
+                            1,
+                            "j",
+                            ("call", ("var", "j"), ("call", ("var", "k"), ("int", 3))),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        "once_alias_then_normal": (
+            "prompt",
+            1,
+            (
+                "add",
+                ("int", 10),
+                (
+                    "shift1",
+                    1,
+                    "k",
+                    (
+                        "shift",
+                        1,
+                        "j",
+                        (
+                            "add",
+                            ("call", ("var", "j"), ("call", ("var", "k"), ("int", 5))),
+                            ("call", ("var", "j"), ("int", 2)),
+                        ),
+                    ),
+                ),
+            ),
+        ),
     }
 
     def test_handwritten_cases_match_reference(self):
@@ -158,6 +216,49 @@ class TestHandWrittenAgainstReference(unittest.TestCase):
             run(schema)
         self.assertEqual(cm.exception.kind, "uncaught")
         with self.assertRaises(delimcc.UncaughtShiftError):
+            delimcc.interpret(to_ast(schema))
+
+    def test_once_double_consumption_both_error(self):
+        # 期望值（'consumed' 类别）只由独立参考机产生。
+        schema = (
+            "prompt",
+            1,
+            (
+                "add",
+                ("int", 10),
+                (
+                    "shift1",
+                    1,
+                    "k",
+                    ("call", ("lam", "a",
+                              ("add", ("call", ("var", "a"), ("int", 5)),
+                                     ("call", ("var", "a"), ("int", 6)))),
+                     ("var", "k")),
+                ),
+            ),
+        )
+        with self.assertRaises(RefError) as cm:
+            run(schema)
+        self.assertEqual(cm.exception.kind, "consumed")
+        with self.assertRaises(delimcc.ConsumedContinuationError):
+            delimcc.interpret(to_ast(schema))
+
+    def test_once_arg_failure_both_error(self):
+        # 实参类型错误：两侧都报 type，而非 consumed（检查点未到达）。
+        schema = (
+            "prompt",
+            1,
+            (
+                "shift1",
+                1,
+                "k",
+                ("call", ("var", "k"), ("add", ("int", 1), ("lam", "z", ("var", "z")))),
+            ),
+        )
+        with self.assertRaises(RefError) as cm:
+            run(schema)
+        self.assertEqual(cm.exception.kind, "type")
+        with self.assertRaises(delimcc.RuntimeTypeError):
             delimcc.interpret(to_ast(schema))
 
     def test_type_error_both_error(self):

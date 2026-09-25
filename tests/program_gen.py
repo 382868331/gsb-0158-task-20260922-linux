@@ -66,7 +66,7 @@ def generate(seed: int, max_depth: int = 4) -> Schema:
                 x = f"v{len(vars_)}_d{d}"
                 return ("lam", x, gen(d - 1, vars_ + [x], tags))
             return ("int", rng.below(6))
-        if choice == 3 and tags:  # 嵌套异 tag 的 shift
+        if choice == 3 and tags:  # 嵌套异 tag 的 shift（普通/一次性各半）
             # 约 1/8 概率使用未被任何 prompt 包裹的 tag 99 -> uncaught。
             tag = 99 if rng.below(8) == 0 else tags[rng.below(len(tags))]
             k = f"k{tag}_{d}_{rng.below(1000)}"
@@ -77,7 +77,8 @@ def generate(seed: int, max_depth: int = 4) -> Schema:
                 body = ("call", ("var", k), arg)
                 if rng.below(2) == 0:  # 再嵌套一次 k 调用：k(k(arg))
                     body = ("call", ("var", k), body)
-            return ("shift", tag, k, body)
+            form = "shift1" if rng.below(2) == 0 else "shift"
+            return (form, tag, k, body)
         if choice == 4:  # k 作为一等值参与（可造成类型错误，两侧机都应报错）
             kvars = [v for v in vars_ if v.startswith("k")]
             if kvars:
@@ -114,4 +115,6 @@ def to_ast(s: Schema):
         return delimcc.Prompt(s[1], to_ast(s[2]))
     if t == "shift":
         return delimcc.Shift(s[1], s[2], to_ast(s[3]))
+    if t == "shift1":
+        return delimcc.ShiftOnce(s[1], s[2], to_ast(s[3]))
     raise ValueError(f"未知模式: {s!r}")  # pragma: no cover
