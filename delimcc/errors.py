@@ -66,3 +66,15 @@ class StepLimitError(EvaluationError):
     def __init__(self, limit: int):
         self.limit = limit
         super().__init__(f"求值步数超过上限 {limit}（预算耗尽，非语义无解）")
+
+
+class UnhandledEffectError(EvaluationError):
+    """choose/fail 效果外层没有搜索处理器。
+
+    原解释入口 ``interpret`` 不自动开启搜索：``Choose/Fail`` 未被
+    ``search`` 处理器捕获时是确定性语义错误，而不是被静默吞掉。
+    """
+
+    def __init__(self, effect: str):
+        self.effect = effect
+        super().__init__(f"{effect} 外层没有搜索处理器（interpret 不自动开启搜索）")

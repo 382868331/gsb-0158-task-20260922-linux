@@ -1,8 +1,10 @@
-"""运行时值（不可变）。
+"""运行时值。
 
 - IntVal：整数结果
 - CloVal：lambda 求值得到的词法闭包（持有不可变 AST body 的共享引用）
 - ContVal：shift 捕获的定界续延（含 tag 与一帧不可变上下文）
+- RefVal：可变存储单元的身份值；单元内容保存在机器的 store 中，
+   搜索分叉时随分支快照隔离（RefVal 自身不可变，变化的是 store 映射）
 
 闭包与续延是不透明值：相等性按身份比较、有可读 repr；整数用
 ``isinstance(v, IntVal)`` 判别后取 ``v.value``。语言无可变引用，
@@ -89,6 +91,32 @@ class ContVal(Value):
         return f"ContVal(tag={self.tag!r}, depth={len(self.frames)})"
 
 
+class RefVal(Value):
+    """可变单元的引用值（身份不可变）。
+
+    rid 是分支内 store 的键；``Deref/Assign`` 经机器状态中的 store
+    访问实际内容。搜索在 choose 分叉点整体快照 store，不同分支对同一
+    rid 的写入互不可见。
+    """
+
+    __slots__ = ("rid",)
+
+    def __init__(self, rid: int):
+        self.rid = rid
+
+    def display(self) -> str:
+        return f"<ref {self.rid}>"
+
+    def __eq__(self, other: object) -> bool:
+        return other is self
+
+    def __hash__(self) -> int:
+        return id(self)
+
+    def __repr__(self) -> str:
+        return f"RefVal(rid={self.rid!r})"
+
+
 def expect_int(v: Value, what: str) -> int:
     """要求运行时值为整数，否则抛 RuntimeTypeError（不静默转换）。"""
     if not isinstance(v, IntVal):
@@ -96,6 +124,8 @@ def expect_int(v: Value, what: str) -> int:
             kind = "lambda"
         elif isinstance(v, ContVal):
             kind = "continuation"
+        elif isinstance(v, RefVal):
+            kind = "ref"
         else:
             kind = type(v).__name__
         raise RuntimeTypeError(f"{what}需要 int，实际得到 {kind}: {v.display()}")

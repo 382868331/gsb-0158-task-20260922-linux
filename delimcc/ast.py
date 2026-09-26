@@ -10,6 +10,12 @@ Call(fn, arg)                   函数调用
 Prompt(tag, body)               定界提示，tag 为显式 int
 Shift(tag, param, body)         捕获到最近同 tag prompt 的求值上下文
 
+Ref(init)                       分配可变单元（机器 store 中的身份值）
+Deref(ref)                      读取单元内容
+Assign(ref, value)              写入单元，返回写入的值
+Choose(options)                 有限多选效果：显式非负个候选表达式
+Fail()                          失败效果：结束当前搜索分支
+
 节点可选带位置信息 loc: 形如 ``("<文件>", 行, 列)`` 的三元组，仅用于
 错误定位；库自身构造的节点 loc 为 None。
 
@@ -26,7 +32,10 @@ from .errors import InvalidProgramError
 
 Loc = Optional[Tuple[str, int, int]]
 
-_VALID = {"Int", "Var", "Add", "Lam", "Call", "Prompt", "Shift"}
+_VALID = {
+    "Int", "Var", "Add", "Lam", "Call", "Prompt", "Shift",
+    "Ref", "Deref", "Assign", "Choose", "Fail",
+}
 
 
 def _is_int(x: object) -> bool:
@@ -113,6 +122,16 @@ def _fields(e: Expr) -> Tuple[object, ...]:
         return (e.tag, e.body)  # type: ignore[attr-defined]
     if k == "Shift":
         return (e.tag, e.param, e.body)  # type: ignore[attr-defined]
+    if k == "Ref":
+        return (e.init,)  # type: ignore[attr-defined]
+    if k == "Deref":
+        return (e.ref,)  # type: ignore[attr-defined]
+    if k == "Assign":
+        return (e.ref, e.value)  # type: ignore[attr-defined]
+    if k == "Choose":
+        return tuple(e.options)  # type: ignore[attr-defined]
+    if k == "Fail":
+        return ()
     raise InvalidProgramError(f"未知节点种类: {k!r}")
 
 
@@ -252,6 +271,118 @@ class Shift(Expr):
 
     def with_loc(self, loc: Loc) -> "Shift":
         return Shift(self.tag, self.param, self.body, loc)
+
+
+class Ref(Expr):
+    """分配一个可变单元，初值为 init 的求值结果。
+
+    单元身份是一个不透明 :class:`~delimcc.values.RefVal`；内容保存在
+    机器 store 中。搜索在 choose 分叉点快照 store，各分支写入相互隔离。
+    """
+
+    __slots__ = ("init",)
+    kind = "Ref"
+
+    def __init__(self, init: Expr, loc: Loc = None):
+        super().__init__(loc)
+        self.init = _check_child(init, "Ref.init", loc)
+
+    def children(self) -> Tuple["Expr", ...]:
+        return (self.init,)
+
+    def with_loc(self, loc: Loc) -> "Ref":
+        return Ref(self.init, loc)
+
+
+class Deref(Expr):
+    """读取可变单元的当前内容；ref 必须求值为 RefVal。"""
+
+    __slots__ = ("ref",)
+    kind = "Deref"
+
+    def __init__(self, ref: Expr, loc: Loc = None):
+        super().__init__(loc)
+        self.ref = _check_child(ref, "Deref.ref", loc)
+
+    def children(self) -> Tuple["Expr", ...]:
+        return (self.ref,)
+
+    def with_loc(self, loc: Loc) -> "Deref":
+        return Deref(self.ref, loc)
+
+
+class Assign(Expr):
+    """把 value 写入 ref 单元；返回写入的 value。
+
+    按值左到右：先求 ref 再求 value。
+    """
+
+    __slots__ = ("ref", "value")
+    kind = "Assign"
+
+    def __init__(self, ref: Expr, value: Expr, loc: Loc = None):
+        super().__init__(loc)
+        self.ref = _check_child(ref, "Assign.ref", loc)
+        self.value = _check_child(value, "Assign.value", loc)
+
+    def children(self) -> Tuple["Expr", ...]:
+        return (self.ref, self.value)
+
+    def with_loc(self, loc: Loc) -> "Assign":
+        return Assign(self.ref, self.value, loc)
+
+
+class Choose(Expr):
+    """有限多选效果：候选必须是**显式有限**的 Expr 序列。
+
+    仅在 :func:`delimcc.search` / :func:`delimcc.iter_search` 的搜索
+    处理器内有效：搜索在分叉点快照当前机器状态（含 store），按候选
+    顺序广度轮转。空候选与 :class:`Fail` 等价（结束当前分支）。
+    原入口 :func:`delimcc.interpret` 不安装处理器，遇到它抛
+    ``UnhandledEffectError``。
+    """
+
+    __slots__ = ("options",)
+    kind = "Choose"
+
+    def __init__(self, options, loc: Loc = None):
+        super().__init__(loc)
+        if not isinstance(options, (tuple, list)):
+            raise InvalidProgramError(
+                f"Choose.options 必须是 tuple/list（显式有限候选），得到 {type(options).__name__}",
+                loc,
+            )
+        checked = tuple(
+            _check_child(o, f"Choose.options[{i}]", loc)
+            for i, o in enumerate(options)
+        )
+        self.options = checked
+
+    def children(self) -> Tuple["Expr", ...]:
+        return tuple(self.options)
+
+    def with_loc(self, loc: Loc) -> "Choose":
+        return Choose(self.options, loc)
+
+
+class Fail(Expr):
+    """失败效果：只结束当前搜索分支，不影响其他候选。
+
+    未被搜索处理器捕获时（``interpret``）抛 ``UnhandledEffectError``。
+    ``Fail`` 无子表达式、无参数。
+    """
+
+    __slots__ = ()
+    kind = "Fail"
+
+    def __init__(self, loc: Loc = None):
+        super().__init__(loc)
+
+    def children(self) -> Tuple["Expr", ...]:
+        return ()
+
+    def with_loc(self, loc: Loc) -> "Fail":
+        return Fail(loc)
 
 
 def _check_child(e: object, where: str, loc: Loc) -> Expr:
