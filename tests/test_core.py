@@ -8,11 +8,13 @@ import unittest
 from delimcc import (
     Add,
     Call,
+    ContinuationAlreadyResumedError,
     Event,
     Int,
     InvalidProgramError,
     Lam,
     Prompt,
+    Shift1,
     RuntimeTypeError,
     Shift,
     StepLimitError,
@@ -248,6 +250,173 @@ class TestContinuationReuse(unittest.TestCase):
         self.assertIn("prompt_rewrap_enter", names)
         self.assertIn("prompt_rewrap_exit", names)
         self.assertEqual(names[-1], "result")
+
+
+class TestOneShotContinuation(unittest.TestCase):
+    def test_single_resume_works_like_shift(self):
+        # 10 + shift1(k, k(5)) = 15（一次恢复与 shift 行为一致）。
+        e = Prompt(
+            1,
+            Add(Int(10), Shift1(1, "k", Call(Var("k"), Int(5)))),
+        )
+        self.assertEqual(iv(e), 15)
+
+    def test_second_resume_fails_even_nested(self):
+        # k(k(5))：第二次恢复在恢复后上下文内发生，必须报错。
+        e = Prompt(
+            1,
+            Add(Int(10), Shift1(1, "k", Call(Var("k"), Call(Var("k"), Int(5))))),
+        )
+        with self.assertRaises(ContinuationAlreadyResumedError) as cm:
+            interpret(e)
+        self.assertEqual(cm.exception.tag, 1)
+
+    def test_second_resume_fails_independent_calls(self):
+        # k(2) + k(3)：第一次调用成功后，加法右支的第二次调用失败。
+        e = Prompt(
+            3,
+            Shift1(
+                3,
+                "k",
+                Add(Call(Var("k"), Int(2)), Call(Var("k"), Int(3))),
+            ),
+        )
+        with self.assertRaises(ContinuationAlreadyResumedError):
+            interpret(e)
+
+    def test_spent_state_shared_through_alias(self):
+        # k 经别名 f 传给另一变量：f 恢复成功后，再用 k 必须失败；
+        # 反之亦然（对象身份共享，不是按变量名记账）。
+        e_alias_first = Prompt(
+            2,
+            Add(
+                Int(100),
+                Shift1(
+                    2,
+                    "k",
+                    Call(
+                        Lam(
+                            "f",
+                            Add(
+                                Call(Var("f"), Int(4)),
+                                Call(Var("k"), Int(5)),
+                            ),
+                        ),
+                        Var("k"),
+                    ),
+                ),
+            ),
+        )
+        with self.assertRaises(ContinuationAlreadyResumedError):
+            interpret(e_alias_first)
+
+    def test_failure_before_consume_does_not_spend(self):
+        # 实参自身求值失败（类型错误）发生在消费点之前：续延保持
+        # fresh，不能误报“一次性续延复用”。消费翻转的值级不变量见
+        # TestOneShotValueState；语言内无异常处理构造，故这里整体以
+        # 实参的 RuntimeTypeError 终止，而不是 ContinuationAlreadyResumed。
+        e = Prompt(
+            6,
+            Add(
+                Int(10),
+                Shift1(
+                    6,
+                    "k",
+                        Call(
+                            Lam("first", Call(Var("k"), Int(7))),
+                            Call(Var("k"), Add(Int(1), Lam("z", Var("z")))),
+                        ),
+                ),
+            ),
+        )
+        with self.assertRaises(RuntimeTypeError):
+            interpret(e)
+
+    def test_one_shot_and_reusable_coexist_nested(self):
+        # prompt1(prompt2( 1 + shift1_2(k, shift_1(j, j(k(3)) + j(100))) ))
+        # j 是可复用续延（调用两次），k 是一次性续延（只调用一次）：
+        # j 上下文为 prompt2(...) 整体（含结果），j(X) = X。
+        # 内层：k(3)=4；j(4)+j(100)=4+100=104。
+        e = Prompt(
+            1,
+            Prompt(
+                2,
+                Add(
+                    Int(1),
+                    Shift1(
+                        2,
+                        "k",
+                        Shift(
+                            1,
+                            "j",
+                            Add(
+                                Call(Var("j"), Call(Var("k"), Int(3))),
+                                Call(Var("j"), Int(100)),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        self.assertEqual(iv(e), 104)
+
+    def test_same_tag_nesting_scopes_oneshot_correctly(self):
+        # 同 tag 嵌套：内层 shift1 只捕获到内层 prompt；外层 +100 保留。
+        e = Prompt(
+            3,
+            Add(
+                Int(100),
+                Prompt(
+                    3,
+                    Add(Int(1), Shift1(3, "k", Call(Var("k"), Int(11)))),
+                ),
+            ),
+        )
+        self.assertEqual(iv(e), 112)
+
+    def test_uncaught_shift1_is_same_semantic_error(self):
+        with self.assertRaises(UncaughtShiftError) as cm:
+            interpret(Shift1(5, "k", Int(0)))
+        self.assertEqual(cm.exception.tag, 5)
+
+    def test_nonlocal_return_abandons_oneshot(self):
+        # body 不调用 k：一次性续延被放弃，42 直接成为 prompt 结果。
+        e = Prompt(
+            1,
+            Call(Lam("x", Add(Var("x"), Int(1))), Shift1(1, "k", Int(42))),
+        )
+        self.assertEqual(iv(e), 42)
+
+    def test_events_distinguish_shift1(self):
+        e = Prompt(1, Add(Int(10), Shift1(1, "k", Call(Var("k"), Int(5)))))
+        names = [ev.name for ev in interpret(e, trace=True).events]
+        self.assertIn("shift1_capture", names)
+        self.assertIn("oneshot_cont_call", names)
+        self.assertIn("prompt_rewrap_enter", names)
+        self.assertNotIn("shift_capture", names)
+
+    def test_validation_shift1(self):
+        with self.assertRaises(InvalidProgramError):
+            Shift1(True, "k", Int(1))  # type: ignore[arg-type]
+        with self.assertRaises(InvalidProgramError):
+            Shift1(1, "", Int(1))
+        with self.assertRaises(InvalidProgramError):
+            Shift1(1, "k", 2)  # type: ignore[arg-type]
+
+
+class TestOneShotValueState(unittest.TestCase):
+    def test_consume_is_identity_shared_and_atomic(self):
+        from delimcc import OneShotContVal
+
+        k = OneShotContVal(9, ())
+        alias = k  # 同一对象的另一变量名
+        self.assertFalse(k.spent)
+        self.assertIn("fresh", k.display())
+        k.consume()  # 第一次：提交成功
+        self.assertTrue(k.spent)
+        self.assertIn("spent", alias.display())
+        with self.assertRaises(ContinuationAlreadyResumedError):
+            alias.consume()  # 通过别名的第二次恢复必须失败
 
 
 class TestRuntimeTypeErrors(unittest.TestCase):

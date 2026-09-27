@@ -18,6 +18,7 @@ ERR_MAP = {
     "uncaught": delimcc.UncaughtShiftError,
     "type": delimcc.RuntimeTypeError,
     "unbound": delimcc.UnboundVariableError,
+    "resumed": delimcc.ContinuationAlreadyResumedError,
 }
 
 
@@ -41,6 +42,8 @@ def run_both(schema):
             if isinstance(ex, delimcc.RuntimeTypeError)
             else "unbound"
             if isinstance(ex, delimcc.UnboundVariableError)
+            else "resumed"
+            if isinstance(ex, delimcc.ContinuationAlreadyResumedError)
             else "steps"
             if isinstance(ex, delimcc.StepLimitError)
             else "other"
@@ -142,6 +145,42 @@ class TestHandWrittenAgainstReference(unittest.TestCase):
                 ),
             ),
         ),
+        "oneshot_single": (
+            "prompt",
+            1,
+            (
+                "add",
+                ("int", 10),
+                ("shift1", 1, "k", ("call", ("var", "k"), ("int", 5))),
+            ),
+        ),
+        "oneshot_coexist_reusable": (
+            "prompt",
+            1,
+            (
+                "prompt",
+                2,
+                (
+                    "add",
+                    ("int", 1),
+                    (
+                        "shift1",
+                        2,
+                        "k",
+                        (
+                            "shift",
+                            1,
+                            "j",
+                            (
+                                "add",
+                                ("call", ("var", "j"), ("call", ("var", "k"), ("int", 3))),
+                                ("call", ("var", "j"), ("int", 100)),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
     }
 
     def test_handwritten_cases_match_reference(self):
@@ -158,6 +197,59 @@ class TestHandWrittenAgainstReference(unittest.TestCase):
             run(schema)
         self.assertEqual(cm.exception.kind, "uncaught")
         with self.assertRaises(delimcc.UncaughtShiftError):
+            delimcc.interpret(to_ast(schema))
+
+    def test_oneshot_reuse_both_error(self):
+        schema = (
+            "prompt",
+            1,
+            (
+                "add",
+                ("int", 10),
+                (
+                    "shift1",
+                    1,
+                    "k",
+                    ("call", ("var", "k"), ("call", ("var", "k"), ("int", 5))),
+                ),
+            ),
+        )
+        with self.assertRaises(RefError) as cm:
+            run(schema)
+        self.assertEqual(cm.exception.kind, "resumed")
+        with self.assertRaises(delimcc.ContinuationAlreadyResumedError):
+            delimcc.interpret(to_ast(schema))
+
+    def test_oneshot_alias_reuse_both_error(self):
+        # k 经 lambda 参数别名 f：f 恢复后再用 k，两侧都应报复用错误。
+        schema = (
+            "prompt",
+            2,
+            (
+                "add",
+                ("int", 100),
+                (
+                    "shift1",
+                    2,
+                    "k",
+                    (
+                        "call",
+                        (
+                            "lam",
+                            "f",
+                            ("add",
+                             ("call", ("var", "f"), ("int", 4)),
+                             ("call", ("var", "k"), ("int", 5))),
+                        ),
+                        ("var", "k"),
+                    ),
+                ),
+            ),
+        )
+        with self.assertRaises(RefError) as cm:
+            run(schema)
+        self.assertEqual(cm.exception.kind, "resumed")
+        with self.assertRaises(delimcc.ContinuationAlreadyResumedError):
             delimcc.interpret(to_ast(schema))
 
     def test_type_error_both_error(self):

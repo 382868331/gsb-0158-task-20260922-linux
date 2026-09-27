@@ -60,6 +60,18 @@ class UncaughtShiftError(EvaluationError):
         super().__init__(f"shift 找不到 tag={tag} 的包围 prompt")
 
 
+class ContinuationAlreadyResumedError(EvaluationError):
+    """一次性续延（shift1 捕获）被第二次恢复。
+
+    一次性续延以对象身份记录消费状态：无论通过哪个变量别名访问，
+    只要此前已有一次恢复成功提交，再次调用即报此错。
+    """
+
+    def __init__(self, tag: int):
+        self.tag = tag
+        super().__init__(f"一次性续延已被消费，不能再次恢复（tag={tag}）")
+
+
 class StepLimitError(EvaluationError):
     """求值步数达到预算上限仍未结束（资源预算耗尽）。"""
 

@@ -1,17 +1,20 @@
-"""运行时值（不可变）。
+"""运行时值。
 
 - IntVal：整数结果
 - CloVal：lambda 求值得到的词法闭包（持有不可变 AST body 的共享引用）
-- ContVal：shift 捕获的定界续延（含 tag 与一帧不可变上下文）
+- ContVal：shift 捕获的可复用定界续延（含 tag 与一帧不可变上下文）
+- OneShotContVal：shift1 捕获的一次性定界续延；帧不可变，但带有恰好
+  翻转一次的消费标志，全程序只能成功恢复一次
 
 闭包与续延是不透明值：相等性按身份比较、有可读 repr；整数用
-``isinstance(v, IntVal)`` 判别后取 ``v.value``。语言无可变引用，
-值一经产生不再改变；续延值可多次调用，每次调用都不修改自身帧。
+``isinstance(v, IntVal)`` 判别后取 ``v.value``。普通值与可复用续延
+一经产生不再改变；一次性续延是唯一带（单向）状态的运行时值，其
+消费状态挂在对象身份上，变量别名共享。
 """
 
 from __future__ import annotations
 
-from .errors import RuntimeTypeError
+from .errors import ContinuationAlreadyResumedError, RuntimeTypeError
 
 
 class Value:
@@ -89,11 +92,53 @@ class ContVal(Value):
         return f"ContVal(tag={self.tag!r}, depth={len(self.frames)})"
 
 
+class OneShotContVal(Value):
+    """shift1 捕获的一次性续延值。
+
+    与 :class:`ContVal` 的唯一语义差别是只能成功恢复一次：``consume()``
+    在恢复提交点被调用，标志翻转保证“成功恢复至多一次”。状态属于
+    **对象身份**：把该值经参数传递/存入多个变量形成别名后，任一别名
+    的成功恢复都会使其他别名上的再次调用抛出
+    :class:`ContinuationAlreadyResumedError`。
+
+    帧元组本身不可变；只有 spent 标志会恰好翻转一次。
+    """
+
+    __slots__ = ("tag", "frames", "spent")
+
+    def __init__(self, tag: int, frames: tuple):
+        self.tag = tag
+        self.frames = frames
+        self.spent = False
+
+    def consume(self) -> None:
+        """在恢复提交点声明消费；已消费则报错（不改动任何状态）。"""
+        if self.spent:
+            raise ContinuationAlreadyResumedError(self.tag)
+        self.spent = True
+
+    def display(self) -> str:
+        state = "spent" if self.spent else "fresh"
+        return f"<one-shot continuation tag={self.tag} depth={len(self.frames)} {state}>"
+
+    def __eq__(self, other: object) -> bool:
+        return other is self
+
+    def __hash__(self) -> int:
+        return id(self)
+
+    def __repr__(self) -> str:
+        state = "spent" if self.spent else "fresh"
+        return f"OneShotContVal(tag={self.tag!r}, depth={len(self.frames)}, {state})"
+
+
 def expect_int(v: Value, what: str) -> int:
     """要求运行时值为整数，否则抛 RuntimeTypeError（不静默转换）。"""
     if not isinstance(v, IntVal):
         if isinstance(v, CloVal):
             kind = "lambda"
+        elif isinstance(v, OneShotContVal):
+            kind = "one-shot continuation"
         elif isinstance(v, ContVal):
             kind = "continuation"
         else:

@@ -3,7 +3,7 @@
 公开接口见包顶层导出；语言定义与求值契约见 README.md。
 """
 
-from .ast import Add, Call, Expr, Int, Lam, Prompt, Shift, Var
+from .ast import Add, Call, Expr, Int, Lam, Prompt, Shift, Shift1, Var
 from .errors import (
     DelimccError,
     EvaluationError,
@@ -12,9 +12,10 @@ from .errors import (
     StepLimitError,
     UnboundVariableError,
     UncaughtShiftError,
+    ContinuationAlreadyResumedError,
 )
 from .interpreter import Event, Result, interpret
-from .values import CloVal, ContVal, IntVal
+from .values import CloVal, ContVal, IntVal, OneShotContVal
 
 __all__ = [
     "Expr",
@@ -25,9 +26,12 @@ __all__ = [
     "Call",
     "Prompt",
     "Shift",
+    "Shift1",
     "IntVal",
     "CloVal",
     "ContVal",
+    "OneShotContVal",
+    "ContinuationAlreadyResumedError",
     "Event",
     "Result",
     "interpret",

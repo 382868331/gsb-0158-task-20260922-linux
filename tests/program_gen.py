@@ -47,7 +47,7 @@ def generate(seed: int, max_depth: int = 4) -> Schema:
             if vars_ and rng.below(3) == 0:
                 return ("var", vars_[rng.below(len(vars_))])
             return ("int", rng.below(6))
-        choice = rng.below(7)
+        choice = rng.below(8)
         if choice == 0:  # 加法
             return ("add", gen(d - 1, vars_, tags), gen(d - 1, vars_, tags))
         if choice == 1:  # 立即调用 lambda（fn 位置必为 lam）
@@ -66,7 +66,7 @@ def generate(seed: int, max_depth: int = 4) -> Schema:
                 x = f"v{len(vars_)}_d{d}"
                 return ("lam", x, gen(d - 1, vars_ + [x], tags))
             return ("int", rng.below(6))
-        if choice == 3 and tags:  # 嵌套异 tag 的 shift
+        if choice == 3 and tags:  # 嵌套异 tag 的 shift（可复用续延）
             # 约 1/8 概率使用未被任何 prompt 包裹的 tag 99 -> uncaught。
             tag = 99 if rng.below(8) == 0 else tags[rng.below(len(tags))]
             k = f"k{tag}_{d}_{rng.below(1000)}"
@@ -78,8 +78,19 @@ def generate(seed: int, max_depth: int = 4) -> Schema:
                 if rng.below(2) == 0:  # 再嵌套一次 k 调用：k(k(arg))
                     body = ("call", ("var", k), body)
             return ("shift", tag, k, body)
+        if choice == 7 and tags:  # shift1：一次性续延
+            tag = 99 if rng.below(8) == 0 else tags[rng.below(len(tags))]
+            k = f"s{tag}_{d}_{rng.below(1000)}"
+            body = gen(d - 1, vars_ + [k], tags)
+            if rng.below(2) == 0:
+                arg = gen(max(d - 2, 0), vars_, tags)
+                body = ("call", ("var", k), arg)
+                # 约一半概率二次恢复 -> 两侧都应报一次性续延复用错误。
+                if rng.below(2) == 0:
+                    body = ("call", ("var", k), body)
+            return ("shift1", tag, k, body)
         if choice == 4:  # k 作为一等值参与（可造成类型错误，两侧机都应报错）
-            kvars = [v for v in vars_ if v.startswith("k")]
+            kvars = [v for v in vars_ if v.startswith(("k", "s"))]
             if kvars:
                 return ("add", ("int", rng.below(4)), ("var", kvars[-1]))
             return ("int", rng.below(6))
@@ -114,4 +125,6 @@ def to_ast(s: Schema):
         return delimcc.Prompt(s[1], to_ast(s[2]))
     if t == "shift":
         return delimcc.Shift(s[1], s[2], to_ast(s[3]))
+    if t == "shift1":
+        return delimcc.Shift1(s[1], s[2], to_ast(s[3]))
     raise ValueError(f"未知模式: {s!r}")  # pragma: no cover

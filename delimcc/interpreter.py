@@ -11,6 +11,15 @@
 * 调用续延 ``k(v)`` 是**组合式**恢复：把捕获帧接到当前栈顶，其下
   重新压入同 tag 的定界帧，再以 v 驱动捕获栈；不丢弃调用点以下的
   任何帧。续延值不可变，因此可多次调用，每次行为一致。
+* ``Shift1`` 与 ``Shift`` 的捕获规则完全一致，区别仅在绑定值：
+  shift1 绑定**一次性**续延。其消费点被严格定义为“实参表达式已经
+  正常求值为值、且恢复即将提交”的时刻：在压入重包 prompt/捕获帧、
+  切换控制之前，先原子翻转消费标志——若对象已被消费，立即抛
+  ``ContinuationAlreadyResumedError``，**不发生恢复、不消耗实参之外
+  的任何状态**（实参既已按值语义求值完毕，其过程本身无法撤销，
+  语言无副作用故无部分变更）。反之，只要标志翻转成功，恢复即视为
+  已提交。消费状态挂在续延对象上，变量别名共享：通过别的变量再次
+  访问同一对象同样失败。
 * “步”指一次机器迁移（消解一个求值点或处理一个返回帧）。超出
   ``max_steps`` 抛 ``StepLimitError``（预算耗尽，与语义无解严格
   区分）。节点数在求值前以迭代方式静态统计，超限是
@@ -31,7 +40,7 @@ from .errors import (
     UnboundVariableError,
     UncaughtShiftError,
 )
-from .values import CloVal, ContVal, IntVal, Value, expect_int
+from .values import CloVal, ContVal, IntVal, OneShotContVal, Value, expect_int
 
 DEFAULT_MAX_NODES = 1000
 DEFAULT_MAX_STEPS = 20000
@@ -58,7 +67,9 @@ class Event:
       ``prompt_rewrap_enter(tag)`` / ``prompt_rewrap_exit(tag, 值展示)``
       （仅由 k(v) 恢复时重新包裹产生）
       ``shift_capture(tag, 捕获帧数)``
+      ``shift1_capture(tag, 捕获帧数)``
       ``cont_call(tag, 续延帧数)``
+      ``oneshot_cont_call(tag, 续延帧数)``
       ``add(左, 右, 和)``
       ``result(值展示)``
     """
@@ -119,6 +130,18 @@ def _lookup(env: Env, name: str) -> Value:
             return val
         env = outer
     raise UnboundVariableError(name)
+
+
+def _find_prompt(st: Stack, tag: int) -> int:
+    """自栈顶向栈底找最近同 tag 定界帧的下标；不存在返回 -1。
+
+    Shift 与 Shift1 共用同一捕获规则（最近同 tag prompt）。
+    """
+    for j in range(len(st) - 1, -1, -1):
+        fr = st[j]
+        if fr[0] == "prompt" and fr[1] == tag:
+            return j
+    return -1
 
 
 def interpret(
@@ -195,20 +218,27 @@ def interpret(
                 e = e.body  # type: ignore[attr-defined]
             elif k == "Shift":
                 tag = e.tag  # type: ignore[attr-defined]
-                idx = -1
-                for j in range(len(st) - 1, -1, -1):
-                    fr = st[j]
-                    if fr[0] == "prompt" and fr[1] == tag:
-                        idx = j
-                        break
+                idx = _find_prompt(st, tag)
                 if idx < 0:
-                    # 无解：不存在同 tag 的包围提示。
                     raise UncaughtShiftError(tag)
                 captured = st[idx + 1 :]
                 st = st[: idx + 1]  # 保留定界帧：body 在该 prompt 内求值
                 if events is not None:
                     events.append(Event("shift_capture", tag, len(captured)))
-                v = ContVal(tag, captured)  # 临时复用 v 无意义，直接扩展环境
+                v = ContVal(tag, captured)
+                env = (env, e.param, v)  # type: ignore[attr-defined]
+                e = e.body  # type: ignore[attr-defined]
+            elif k == "Shift1":
+                tag = e.tag  # type: ignore[attr-defined]
+                idx = _find_prompt(st, tag)
+                if idx < 0:
+                    # 与 Shift 相同的无解语义（尚未产生任何续延对象）。
+                    raise UncaughtShiftError(tag)
+                captured = st[idx + 1 :]
+                st = st[: idx + 1]
+                if events is not None:
+                    events.append(Event("shift1_capture", tag, len(captured)))
+                v = OneShotContVal(tag, captured)
                 env = (env, e.param, v)  # type: ignore[attr-defined]
                 e = e.body  # type: ignore[attr-defined]
             else:  # pragma: no cover - 构造器已穷尽种类
@@ -236,9 +266,11 @@ def interpret(
                 v = IntVal(s)
                 # mode 保持 return：和继续上交。
             elif fk == "callFn":
-                if not isinstance(v, (CloVal, ContVal)):
+                if not isinstance(v, (CloVal, ContVal, OneShotContVal)):
                     kind = "int" if isinstance(v, IntVal) else type(v).__name__
-                    raise RuntimeTypeError(f"只能调用 lambda/continuation，得到 {kind}")
+                    raise RuntimeTypeError(
+                        f"只能调用 lambda/continuation，得到 {kind}"
+                    )
                 st = st + (("callArg", v),)
                 e, env = fr[1], fr[2]
                 mode = "eval"
@@ -248,13 +280,24 @@ def interpret(
                     env = (fn.env, fn.param, v)
                     e = fn.body
                     mode = "eval"
-                else:  # ContVal；callFn 已排除其他类型
+                elif isinstance(fn, ContVal):
                     if events is not None:
                         events.append(Event("cont_call", fn.tag, len(fn.frames)))
                         events.append(Event("prompt_rewrap_enter", fn.tag))
                     # 组合式恢复（tuple 为栈底->栈顶）：调用点上下文在最
                     # 外（保留不动），向内依次是重包的同 tag prompt 与捕获
                     # 帧；v 从最内的洞开始驱动捕获栈。
+                    st = st + (("prompt", fn.tag, "rewrap"),) + fn.frames
+                else:  # OneShotContVal；callFn 已排除其他类型
+                    # 消费点：实参 v 已按值求值完毕。先原子地翻转消费
+                    # 标志——若已被消费（含经其他变量别名的成功恢复），
+                    # 在此报错，不提交恢复、不压入任何帧。
+                    fn.consume()
+                    if events is not None:
+                        events.append(
+                            Event("oneshot_cont_call", fn.tag, len(fn.frames))
+                        )
+                        events.append(Event("prompt_rewrap_enter", fn.tag))
                     st = st + (("prompt", fn.tag, "rewrap"),) + fn.frames
             elif fk == "prompt":
                 if events is not None:
