@@ -18,6 +18,7 @@ ERR_MAP = {
     "uncaught": delimcc.UncaughtShiftError,
     "type": delimcc.RuntimeTypeError,
     "unbound": delimcc.UnboundVariableError,
+    "consumed": delimcc.ContinuationConsumedError,
 }
 
 
@@ -41,6 +42,8 @@ def run_both(schema):
             if isinstance(ex, delimcc.RuntimeTypeError)
             else "unbound"
             if isinstance(ex, delimcc.UnboundVariableError)
+            else "consumed"
+            if isinstance(ex, delimcc.ContinuationConsumedError)
             else "steps"
             if isinstance(ex, delimcc.StepLimitError)
             else "other"
@@ -159,6 +162,65 @@ class TestHandWrittenAgainstReference(unittest.TestCase):
         self.assertEqual(cm.exception.kind, "uncaught")
         with self.assertRaises(delimcc.UncaughtShiftError):
             delimcc.interpret(to_ast(schema))
+
+    def test_oneshot_cases_match_reference(self):
+        # 一次性续延：正常恢复、重复恢复（consumed）、别名重复、
+        # 嵌套异 tag 与可重复续延共存。
+        v = lambda n: ("int", n)
+        once_ok = (
+            "prompt", 1,
+            ("add", v(10),
+             ("shift1", 1, "k", ("call", ("var", "k"), v(5)))),
+        )
+        once_twice = (
+            "prompt", 1,
+            ("add", v(10),
+             ("shift1", 1, "k",
+              ("add", ("call", ("var", "k"), v(5)),
+                    ("call", ("var", "k"), v(6))))),
+        )
+        once_alias = (
+            "prompt", 1,
+            ("add", v(10),
+             ("shift1", 1, "k",
+              ("call",
+               ("lam", "f",
+                ("add", ("call", ("var", "f"), v(1)),
+                      ("call", ("var", "f"), v(2)))),
+               ("var", "k")))),
+        )
+        once_mixed_inner = (
+            "shift1", 2, "k",
+            ("shift", 1, "j",
+             ("call", ("var", "j"), ("call", ("var", "k"), v(100)))),
+        )
+        once_mixed = (
+            "prompt", 1,
+            ("add", v(1),
+             ("prompt", 2, ("add", v(2), once_mixed_inner))),
+        )
+        once_arg_fail = (
+            "prompt", 1,
+            ("add", v(10),
+             ("shift1", 1, "k",
+              ("call", ("var", "k"),
+               ("add", v(1), ("lam", "z", ("var", "z")))))),
+        )
+        cases = {
+            "once_ok": once_ok,
+            "once_twice_consumed": once_twice,
+            "once_alias_consumed": once_alias,
+            "once_nested_mixed": once_mixed,
+            "once_arg_fail_not_consumed": once_arg_fail,
+        }
+        for name, schema in cases.items():
+            with self.subTest(case=name):
+                ref_out, core_out = run_both(schema)
+                self.assertEqual(ref_out[0], core_out[0], msg=f"{name}: {ref_out} vs {core_out}")
+                if ref_out[0] == "err":
+                    self.assertEqual(ref_out[1], core_out[1], msg=name)
+                else:
+                    self.assertEqual(core_out[1].display(), str(ref_out[1][1]), msg=name)
 
     def test_type_error_both_error(self):
         schema = ("add", ("int", 1), ("lam", "x", ("var", "x")))

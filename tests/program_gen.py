@@ -66,7 +66,7 @@ def generate(seed: int, max_depth: int = 4) -> Schema:
                 x = f"v{len(vars_)}_d{d}"
                 return ("lam", x, gen(d - 1, vars_ + [x], tags))
             return ("int", rng.below(6))
-        if choice == 3 and tags:  # 嵌套异 tag 的 shift
+        if choice == 3 and tags:  # 嵌套异 tag 的 shift（含一次性变体）
             # 约 1/8 概率使用未被任何 prompt 包裹的 tag 99 -> uncaught。
             tag = 99 if rng.below(8) == 0 else tags[rng.below(len(tags))]
             k = f"k{tag}_{d}_{rng.below(1000)}"
@@ -75,9 +75,21 @@ def generate(seed: int, max_depth: int = 4) -> Schema:
             if rng.below(2) == 0:
                 arg = gen(max(d - 2, 0), vars_, tags)
                 body = ("call", ("var", k), arg)
-                if rng.below(2) == 0:  # 再嵌套一次 k 调用：k(k(arg))
+                one_shot = rng.below(2) == 0
+                # 一次性续延的重复调用必然报 consumed，故只对可重复
+                # 续延生成 k(k(arg)) 嵌套恢复；一次性改为先经 lambda
+                # 别名再恢复一次（仍只有一次成功恢复）。
+                if not one_shot and rng.below(2) == 0:
                     body = ("call", ("var", k), body)
-            return ("shift", tag, k, body)
+                if one_shot:
+                    alias = f"a{tag}_{d}_{rng.below(1000)}"
+                    body = (
+                        "call",
+                        ("lam", alias, ("call", ("var", alias), arg)),
+                        ("var", k),
+                    )
+            form = "shift1" if rng.below(3) == 0 else "shift"
+            return (form, tag, k, body)
         if choice == 4:  # k 作为一等值参与（可造成类型错误，两侧机都应报错）
             kvars = [v for v in vars_ if v.startswith("k")]
             if kvars:
@@ -112,6 +124,7 @@ def to_ast(s: Schema):
         return delimcc.Call(to_ast(s[1]), to_ast(s[2]))
     if t == "prompt":
         return delimcc.Prompt(s[1], to_ast(s[2]))
-    if t == "shift":
-        return delimcc.Shift(s[1], s[2], to_ast(s[3]))
+    if t in ("shift", "shift1"):
+        cls = delimcc.ShiftOnce if t == "shift1" else delimcc.Shift
+        return cls(s[1], s[2], to_ast(s[3]))
     raise ValueError(f"未知模式: {s!r}")  # pragma: no cover

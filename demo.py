@@ -1,13 +1,16 @@
-"""固定输入演示：定界续延的非局部返回，以及两个真实触发的拒绝边界。
+"""固定输入演示：定界续延、一次性续延，以及真实触发的拒绝边界。
 
 运行：python demo.py（仓库根目录，约 1 秒内完成，无网络/无第三方依赖）。
 
 内容：
   1. 正常结果——非局部返回：多层函数/加法上下文包围 shift，shift 的
      body 不调用续延 k，直接给出 999，中间上下文被整体放弃。
-  2. 语义边界——shift 找不到同 tag 的 prompt，实际抛出
+  2. 一次性续延——shift_once 捕获的 k 经 lambda 别名只能恢复一次：
+     第一次恢复成功，第二次（即使通过别名 f）触发
+     ContinuationConsumedError。
+  3. 语义边界——shift 找不到同 tag 的 prompt，实际抛出
      UncaughtShiftError（无解，与预算耗尽区分）。
-  3. 输入边界——NaN 不是合法整数字面量，构造时即被
+  4. 输入边界——NaN 不是合法整数字面量，构造时即被
      InvalidProgramError 拒绝（不静默纠正）。
 """
 
@@ -23,6 +26,8 @@ from delimcc import (
     Lam,
     Prompt,
     Shift,
+    ShiftOnce,
+    ContinuationConsumedError,
     UncaughtShiftError,
     Var,
     interpret,
@@ -67,7 +72,54 @@ def main() -> None:
     )
     print(f"   对照（无 shift 的普通求值）= {interpret(ordinary).value.display()}")
 
-    # --- 2. 语义边界：无匹配 prompt -------------------------------------
+    # --- 2. 一次性续延：别名共享消费状态，只能恢复一次 -----------------
+    section("[一次性] shift_once 的 k 经 lambda 别名第二次恢复被拒绝")
+    # 10 + shift1(k, (lambda f. f(1) + f(2))(k))
+    # f(1) 经别名成功恢复一次（10+1=11）；f(2) 再次恢复同一捕获对象，
+    # 即使换了变量名也必须失败。
+    once_program = Prompt(
+        1,
+        Add(
+            Int(10),
+            ShiftOnce(
+                1,
+                "k",
+                Call(
+                    Lam(
+                        "f",
+                        Add(Call(Var("f"), Int(1)), Call(Var("f"), Int(2))),
+                    ),
+                    Var("k"),
+                ),
+            ),
+        ),
+    )
+    try:
+        interpret(once_program, trace=True)
+    except ContinuationConsumedError as ex:
+        print(f"第一次恢复 f(1) 成功；第二次恢复 f(2) 实际捕获: {type(ex).__name__}")
+        print(f"  {ex}")
+    # 同一程序把 shift_once 换成可重复 shift：两次恢复都成功（11+12=23）。
+    reusable_program = Prompt(
+        1,
+        Add(
+            Int(10),
+            Shift(
+                1,
+                "k",
+                Call(
+                    Lam(
+                        "f",
+                        Add(Call(Var("f"), Int(1)), Call(Var("f"), Int(2))),
+                    ),
+                    Var("k"),
+                ),
+            ),
+        ),
+    )
+    print(f"对照：可重复 shift 同一程序结果 = {interpret(reusable_program).value.display()}")
+
+    # --- 3. 语义边界：无匹配 prompt -------------------------------------
     section("[边界] shift(404, k, 0) 外没有 tag=404 的 prompt")
     bad_program = Add(Int(1), Shift(404, "k", Int(0)))
     try:
@@ -76,7 +128,7 @@ def main() -> None:
         print(f"实际捕获异常: {type(ex).__name__}: {ex}")
         print("=> 这是确定性语义错误（无解），区别于步数预算耗尽。")
 
-    # --- 3. 输入边界：NaN / bool 不得作为整数 ---------------------------
+    # --- 4. 输入边界：NaN / bool 不得作为整数 ---------------------------
     section("[边界] Int(NaN) 与 Int(True) 在构造期被拒绝")
     for label, bad in (("float('nan')", float("nan")), ("True", True)):
         try:

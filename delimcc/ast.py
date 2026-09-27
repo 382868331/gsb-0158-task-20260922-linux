@@ -9,6 +9,8 @@ Lam(param, body)                单参数 lambda
 Call(fn, arg)                   函数调用
 Prompt(tag, body)               定界提示，tag 为显式 int
 Shift(tag, param, body)         捕获到最近同 tag prompt 的求值上下文
+                                （可重复恢复的组合式续延）
+ShiftOnce(tag, param, body)     同上，但捕获的续延只能恢复一次
 
 节点可选带位置信息 loc: 形如 ``("<文件>", 行, 列)`` 的三元组，仅用于
 错误定位；库自身构造的节点 loc 为 None。
@@ -26,7 +28,7 @@ from .errors import InvalidProgramError
 
 Loc = Optional[Tuple[str, int, int]]
 
-_VALID = {"Int", "Var", "Add", "Lam", "Call", "Prompt", "Shift"}
+_VALID = {"Int", "Var", "Add", "Lam", "Call", "Prompt", "Shift", "ShiftOnce"}
 
 
 def _is_int(x: object) -> bool:
@@ -112,6 +114,8 @@ def _fields(e: Expr) -> Tuple[object, ...]:
     if k == "Prompt":
         return (e.tag, e.body)  # type: ignore[attr-defined]
     if k == "Shift":
+        return (e.tag, e.param, e.body)  # type: ignore[attr-defined]
+    if k == "ShiftOnce":
         return (e.tag, e.param, e.body)  # type: ignore[attr-defined]
     raise InvalidProgramError(f"未知节点种类: {k!r}")
 
@@ -252,6 +256,29 @@ class Shift(Expr):
 
     def with_loc(self, loc: Loc) -> "Shift":
         return Shift(self.tag, self.param, self.body, loc)
+
+
+class ShiftOnce(Expr):
+    """shift_once(tag, k, body)：捕获规则同 :class:`Shift`，但绑定到
+    ``param`` 的续延是**一次性**的：每个捕获产生的续延对象全程序只能
+    成功恢复一次，重复恢复（即使经不同变量别名）抛
+    ``ContinuationConsumedError``。
+    """
+
+    __slots__ = ("tag", "param", "body")
+    kind = "ShiftOnce"
+
+    def __init__(self, tag: int, param: str, body: Expr, loc: Loc = None):
+        super().__init__(loc)
+        self.tag = _check_tag(tag, loc)
+        self.param = _check_name(param, "shift_once 续延参数名", loc)
+        self.body = _check_child(body, "ShiftOnce.body", loc)
+
+    def children(self) -> Tuple["Expr", ...]:
+        return (self.body,)
+
+    def with_loc(self, loc: Loc) -> "ShiftOnce":
+        return ShiftOnce(self.tag, self.param, self.body, loc)
 
 
 def _check_child(e: object, where: str, loc: Loc) -> Expr:

@@ -4,13 +4,20 @@
 --------
 * 按值、左到右求值；lambda 为词法闭包；语言中无可变引用。
 * ``Prompt(tag, body)`` 在控制栈上压入 ``("prompt", tag)`` 定界帧。
-* ``Shift(tag, k, body)`` 自栈顶向栈底寻找**最近**的同 tag 定界帧：
+* ``Shift(tag, k, body)`` 与 ``ShiftOnce(tag, k, body)`` 自栈顶向栈底
+  寻找**最近**的同 tag 定界帧（捕获规则完全相同；两种续延可共存于
+  同一程序与嵌套作用域，各自只捕获到自己的同 tag 定界帧）：
   - 找到：该帧以上（更靠近栈顶）的全部帧被捕获为不可变续延并绑定
     到 ``k``；定界帧保留，``body`` 在该 prompt **之内**继续求值。
   - 找不到：抛 ``UncaughtShiftError``（确定性语义错误，即无解）。
+  ``Shift`` 的续延可多次恢复；``ShiftOnce`` 的续延只能恢复一次：
+  每次捕获产生唯一对象，经任何变量别名的第二次恢复都抛
+  ``ContinuationConsumedError``。消费在参数求值完成、恢复开始之前的
+  同一迁移内原子置位：参数求值失败时续延尚未消费；恢复一旦开始，
+  即使被恢复的上下文自身抛错也不回滚消费状态。
 * 调用续延 ``k(v)`` 是**组合式**恢复：把捕获帧接到当前栈顶，其下
   重新压入同 tag 的定界帧，再以 v 驱动捕获栈；不丢弃调用点以下的
-  任何帧。续延值不可变，因此可多次调用，每次行为一致。
+  任何帧。可重复续延每次调用行为一致；一次性续延仅此一次。
 * “步”指一次机器迁移（消解一个求值点或处理一个返回帧）。超出
   ``max_steps`` 抛 ``StepLimitError``（预算耗尽，与语义无解严格
   区分）。节点数在求值前以迭代方式静态统计，超限是
@@ -25,6 +32,7 @@ from typing import List, Optional, Tuple
 
 from . import ast as A
 from .errors import (
+    ContinuationConsumedError,
     InvalidProgramError,
     RuntimeTypeError,
     StepLimitError,
@@ -58,7 +66,8 @@ class Event:
       ``prompt_rewrap_enter(tag)`` / ``prompt_rewrap_exit(tag, 值展示)``
       （仅由 k(v) 恢复时重新包裹产生）
       ``shift_capture(tag, 捕获帧数)``
-      ``cont_call(tag, 续延帧数)``
+      ``cont_call(tag, 续延帧数)``（可重复续延恢复）
+      ``once_cont_call(tag, 续延帧数)``（一次性续延恢复）
       ``add(左, 右, 和)``
       ``result(值展示)``
     """
@@ -193,7 +202,7 @@ def interpret(
                     events.append(Event("prompt_enter", tag))
                 st = st + (("prompt", tag, "src"),)
                 e = e.body  # type: ignore[attr-defined]
-            elif k == "Shift":
+            elif k in ("Shift", "ShiftOnce"):
                 tag = e.tag  # type: ignore[attr-defined]
                 idx = -1
                 for j in range(len(st) - 1, -1, -1):
@@ -208,8 +217,8 @@ def interpret(
                 st = st[: idx + 1]  # 保留定界帧：body 在该 prompt 内求值
                 if events is not None:
                     events.append(Event("shift_capture", tag, len(captured)))
-                v = ContVal(tag, captured)  # 临时复用 v 无意义，直接扩展环境
-                env = (env, e.param, v)  # type: ignore[attr-defined]
+                cont = ContVal(tag, captured, once=(k == "ShiftOnce"))
+                env = (env, e.param, cont)  # type: ignore[attr-defined]
                 e = e.body  # type: ignore[attr-defined]
             else:  # pragma: no cover - 构造器已穷尽种类
                 raise InvalidProgramError(f"内部错误：未知节点种类 {k!r}")
@@ -249,8 +258,21 @@ def interpret(
                     e = fn.body
                     mode = "eval"
                 else:  # ContVal；callFn 已排除其他类型
-                    if events is not None:
+                    # 参数 v 已完成求值：此时检查并置位一次性续延的消费
+                    # 状态，随后同一迁移立即恢复。参数求值失败不会走到
+                    # 这里（续延未消费）；恢复开始后上下文内部的错误不
+                    # 回滚消费。
+                    if fn.once:
+                        if fn.consumed:
+                            raise ContinuationConsumedError(fn.tag)
+                        fn.consumed = True
+                        if events is not None:
+                            events.append(
+                                Event("once_cont_call", fn.tag, len(fn.frames))
+                            )
+                    elif events is not None:
                         events.append(Event("cont_call", fn.tag, len(fn.frames)))
+                    if events is not None:
                         events.append(Event("prompt_rewrap_enter", fn.tag))
                     # 组合式恢复（tuple 为栈底->栈顶）：调用点上下文在最
                     # 外（保留不动），向内依次是重包的同 tag prompt 与捕获

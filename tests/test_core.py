@@ -8,6 +8,7 @@ import unittest
 from delimcc import (
     Add,
     Call,
+    ContinuationConsumedError,
     Event,
     Int,
     InvalidProgramError,
@@ -15,6 +16,7 @@ from delimcc import (
     Prompt,
     RuntimeTypeError,
     Shift,
+    ShiftOnce,
     StepLimitError,
     UnboundVariableError,
     UncaughtShiftError,
@@ -248,6 +250,211 @@ class TestContinuationReuse(unittest.TestCase):
         self.assertIn("prompt_rewrap_enter", names)
         self.assertIn("prompt_rewrap_exit", names)
         self.assertEqual(names[-1], "result")
+
+
+class TestOneShotContinuation(unittest.TestCase):
+    """shift_once：捕获/重包语义与 shift 相同，但只能恢复一次。"""
+
+    def test_single_resume_works_like_shift(self):
+        # 10 + shift1(k, k(5)) = 15
+        e = Prompt(
+            1,
+            Add(Int(10), ShiftOnce(1, "k", Call(Var("k"), Int(5)))),
+        )
+        self.assertEqual(iv(e), 15)
+
+    def test_second_resume_raises_consumed(self):
+        e = Prompt(
+            1,
+            Add(
+                Int(10),
+                ShiftOnce(
+                    1,
+                    "k",
+                    Add(Call(Var("k"), Int(5)), Call(Var("k"), Int(6))),
+                ),
+            ),
+        )
+        # 左到右：第一次恢复成功（10+5=15），第二次恢复在恢复开始前
+        # 被拒绝，整个求值失败。
+        with self.assertRaises(ContinuationConsumedError) as cm:
+            interpret(e)
+        self.assertEqual(cm.exception.tag, 1)
+
+    def test_consumed_state_shared_through_aliases(self):
+        # k 经 lambda 参数换名 f：f(1) 已消费，f(2) 必须失败——
+        # 状态属于捕获对象身份，与变量名无关。
+        e = Prompt(
+            1,
+            Add(
+                Int(10),
+                ShiftOnce(
+                    1,
+                    "k",
+                    Call(
+                        Lam(
+                            "f",
+                            Add(
+                                Call(Var("f"), Int(1)),
+                                Call(Var("f"), Int(2)),
+                            ),
+                        ),
+                        Var("k"),
+                    ),
+                ),
+            ),
+        )
+        with self.assertRaises(ContinuationConsumedError):
+            interpret(e)
+
+    def test_two_captures_have_independent_consumption(self):
+        # 外层 prompt 的一次性续延 j 与内层 prompt1 的一次性续延 k 是
+        # 两次独立捕获，各自只能用一次、互不影响。
+        # prompt0( 1000 + prompt1( shift1_1(k, shift1_0(j, j(k(7)))) ) )
+        e = Prompt(
+            0,
+            Add(
+                Int(1000),
+                Prompt(
+                    1,
+                    ShiftOnce(
+                        1,
+                        "k",
+                        ShiftOnce(
+                            0,
+                            "j",
+                            Call(Var("j"), Call(Var("k"), Int(7))),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        self.assertEqual(iv(e), 1007)
+
+    def test_coexist_with_reusable_nested_scopes(self):
+        # 内层一次性 k、外层可重复 j：j 恢复时调用 k（唯一一次成功），
+        # 结果 1+(2+100)=103；k 的作用域止于 prompt2，j 止于 prompt1。
+        inner = ShiftOnce(
+            2,
+            "k",
+            Shift(1, "j", Call(Var("j"), Call(Var("k"), Int(100)))),
+        )
+        e = Prompt(1, Add(Int(1), Prompt(2, Add(Int(2), inner))))
+        self.assertEqual(iv(e), 103)
+
+    def test_reusable_still_reusable_alongside_once(self):
+        # 同一程序中可重复续延照旧多次恢复；一次性续延恰好一次。
+        e = Prompt(
+            7,
+            Add(
+                Int(100),
+                Shift(7, "r", Call(Var("r"), Call(Var("r"), Int(0)))),
+            ),
+        )
+        self.assertEqual(iv(e), 200)
+        e2 = Prompt(
+            7,
+            Add(
+                Int(100),
+                ShiftOnce(7, "o", Call(Var("o"), Int(0))),
+            ),
+        )
+        self.assertEqual(iv(e2), 100)
+
+    def test_failure_before_consumption_leaves_it_usable(self):
+        # k( 1 + <lambda> )：实参求值抛 RuntimeTypeError，此时尚未消费；
+        # 用独立子表达式验证失败类型不是 consumed，且另一个对同一
+        # 捕获的全新求值仍只按一次语义工作（AST 级幂等补充）。
+        e = Prompt(
+            1,
+            Add(
+                Int(10),
+                ShiftOnce(
+                    1,
+                    "k",
+                    Call(Var("k"), Add(Int(1), Lam("z", Var("z")))),
+                ),
+            ),
+        )
+        with self.assertRaises(RuntimeTypeError):
+            interpret(e)
+
+    def test_failure_after_consumption_is_not_rolled_back(self):
+        # 第一次恢复成功驱动上下文，但上下文内部对恢复结果做
+        # 1 + <int-ok>... 这里让恢复后的计算成功，第二次再调必须是
+        # consumed；另测：恢复体内自身抛错后，续延同样已消费。
+        # k(1) 恢复 [10 + ·] = 11 成功；随后 k(2) 被拒绝。
+        e = Prompt(
+            1,
+            Add(
+                Int(10),
+                ShiftOnce(
+                    1,
+                    "k",
+                    Add(
+                        Call(Var("k"), Int(1)),
+                        Call(Var("k"), Int(2)),
+                    ),
+                ),
+            ),
+        )
+        with self.assertRaises(ContinuationConsumedError):
+            interpret(e)
+
+        # 恢复后的上下文自身类型错误：被捕获帧是
+        # (lambda z.z) + ·，洞值 k(1) 先驱动该上下文，随后加法报
+        # RuntimeTypeError——消费先于上下文执行，不回滚。
+        e2 = Prompt(
+            1,
+            Add(
+                Lam("z", Var("z")),
+                ShiftOnce(
+                    1,
+                    "k",
+                    Add(
+                        Call(Var("k"), Int(1)),
+                        Call(Var("k"), Int(2)),
+                    ),
+                ),
+            ),
+        )
+        with self.assertRaises(RuntimeTypeError):
+            interpret(e2)
+
+    def test_nonlocal_return_abandons_once_continuation(self):
+        e = Prompt(
+            1,
+            Call(
+                Lam("x", Add(Var("x"), Int(1))),
+                ShiftOnce(1, "k", Int(42)),
+            ),
+        )
+        self.assertEqual(iv(e), 42)
+
+    def test_uncaught_shift1_is_still_uncaught(self):
+        with self.assertRaises(UncaughtShiftError) as cm:
+            interpret(ShiftOnce(5, "k", Int(0)))
+        self.assertEqual(cm.exception.tag, 5)
+
+    def test_once_value_display_and_events(self):
+        e = Prompt(1, Add(Int(10), ShiftOnce(1, "k", Call(Var("k"), Int(5)))))
+        names = [ev.name for ev in interpret(e, trace=True).events]
+        self.assertIn("once_cont_call", names)
+        self.assertNotIn("cont_call", names)
+        self.assertIn("prompt_rewrap_enter", names)
+
+        # 捕获后、恢复前观察到一次性续延值。
+        e2 = Prompt(1, ShiftOnce(1, "k", Var("k")))
+        d = interpret(e2).value.display()
+        self.assertTrue(d.startswith("<once-continuation tag=1"))
+
+    def test_shift1_validation_matches_shift(self):
+        with self.assertRaises(InvalidProgramError):
+            ShiftOnce(True, "k", Int(1))  # type: ignore[arg-type]
+        with self.assertRaises(InvalidProgramError):
+            ShiftOnce(1, "", Int(1))
+        with self.assertRaises(InvalidProgramError):
+            ShiftOnce(1, "k", 2)  # type: ignore[arg-type]
 
 
 class TestRuntimeTypeErrors(unittest.TestCase):
